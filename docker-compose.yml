@@ -44,7 +44,7 @@ services:
     environment:
       OLLAMA_HOST:  http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
-      VIDEO_FILE:   ${VIDEO_FILE:-/data/testclip.mp4}
+      VIDEO_FILE:   ${VIDEO_FILE:-/data/testclip2.mp4}
       YOLO_MODEL:   ${YOLO_MODEL:-/data/runs/detect/runs/supermarket_finetune/weights/best.pt}
       CONF_THRESH:  ${CONF_THRESH:-0.35}
       YOLO_DEVICE:  ${YOLO_DEVICE:-cpu}

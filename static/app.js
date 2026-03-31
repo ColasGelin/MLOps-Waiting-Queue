@@ -6,14 +6,16 @@ let popupTimer = null;
 const pendingCvCards = new Map();
 
 // ── Checkout state ────────────────────────────────────────────────────────
-let checkoutCount = 2; // Base: checkout 1 & 2 always present
-let extraCounts = { 3: 0, 4: 0 };
+let checkoutCount = 2;
 let prevCounts = { 1: -1, 2: -1, 3: -1, 4: -1 };
+const alertedCheckouts = new Set(); // lanes currently in alert state
 
 // ── DOM refs ────────────────────────────────────────────────────────────
 const $clock      = document.getElementById("clock");
 const $lane1      = document.getElementById("m-lane1");
 const $lane2      = document.getElementById("m-lane2");
+const $lane3      = document.getElementById("m-lane3");
+const $lane4      = document.getElementById("m-lane4");
 const $totalWait  = document.getElementById("m-total-wait");
 const $store      = document.getElementById("m-store");
 const $status     = document.getElementById("m-status");
@@ -21,61 +23,43 @@ const $statusDot  = document.getElementById("status-dot");
 const $cards      = document.getElementById("cards");
 const $popup      = document.getElementById("popup");
 const $eventCount = document.getElementById("event-count");
-const $extraCheckouts = document.getElementById("extra-checkouts");
+const $dots = {
+  1: document.getElementById("dot-co1"),
+  2: document.getElementById("dot-co2"),
+  3: document.getElementById("dot-co3"),
+  4: document.getElementById("dot-co4"),
+};
 
 // ── Clock ───────────────────────────────────────────────────────────────
 function updateClock() {
   const now = new Date();
   $clock.textContent = now.toLocaleTimeString("en-GB", { hour12: false });
 }
+
+function resolveStoreCount(m) {
+  const raw = m.store_count ?? m.customers_in_store ?? m.in_store_count ?? m.clients_visible;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
 updateClock();
 setInterval(updateClock, 1000);
 
-// ── Render extra checkouts (3+) — in-place update, animate on change ────
-function renderExtraCheckouts() {
-  for (let i = 3; i <= 4; i++) {
-    const count = extraCounts[i] ?? 0;
-    const existing = document.getElementById(`checkout-${i}`);
-
-    if (i > checkoutCount) {
-      // Lane closed — remove block and its leading separator if present
-      if (existing) {
-        const sep = existing.previousElementSibling;
-        if (sep && sep.classList.contains("metric-sep")) sep.remove();
-        existing.remove();
-      }
-      prevCounts[i] = -1;
-      continue;
-    }
-
-    if (!existing) {
-      // Lane newly opened — create separator + block (slideInCheckout fires via CSS)
-      const sep = document.createElement("div");
-      sep.className = "metric-sep";
-      $extraCheckouts.appendChild(sep);
-
-      const block = document.createElement("div");
-      block.className = "mblock";
-      block.id = `checkout-${i}`;
-      block.innerHTML = `
-        <div class="mblock-label">Checkout ${i}</div>
-        <div class="mblock-main" id="m-lane${i}">${count} <span class="mblock-unit">waiting</span></div>
-        <div class="mblock-sub">active</div>
-      `;
-      $extraCheckouts.appendChild(block);
-      prevCounts[i] = count;
-      continue;
-    }
-
-    // Lane already in DOM — update count in place, animate only if changed
-    if (count !== prevCounts[i]) {
-      const mainEl = document.getElementById(`m-lane${i}`);
-      if (mainEl) {
-        mainEl.innerHTML = `${count} <span class="mblock-unit">waiting</span>`;
-      }
-      prevCounts[i] = count;
-    }
+// ── Update checkout dots and dim closed lanes ────────────────────────────
+function updateCheckoutDots(open) {
+  for (let i = 1; i <= 4; i++) {
+    const isOpen = i <= open;
+    if ($dots[i]) $dots[i].classList.toggle("open", isOpen);
+    const block = document.getElementById(`mblock-co${i}`);
+    if (block) block.classList.toggle("mblock-closed", !isOpen);
   }
+}
+
+function animateMblock(el) {
+  if (!el) return;
+  el.classList.remove("mblock-count-update");
+  void el.offsetWidth;
+  el.classList.add("mblock-count-update");
 }
 
 // ── Metrics polling ─────────────────────────────────────────────────────
@@ -88,50 +72,57 @@ async function pollMetrics() {
     if (!res.ok) return;
     const m = await res.json();
 
-    extraCounts = {
+    checkoutCount = m.checkouts_open ?? checkoutCount;
+    updateCheckoutDots(checkoutCount);
+
+    // Update all 4 lane counts
+    const counts = {
+      1: m.queue1 ?? 0,
+      2: m.queue2 ?? 0,
       3: m.queue3 ?? 0,
       4: m.queue4 ?? 0,
     };
-    
-    // Update checkout count if changed from LLM action
-    if (m.checkouts_open !== checkoutCount) {
-      checkoutCount = m.checkouts_open;
+    const laneEls = { 1: $lane1, 2: $lane2, 3: $lane3, 4: $lane4 };
+
+    for (let i = 1; i <= 4; i++) {
+      const q = counts[i];
+      if (q !== prevCounts[i]) {
+        laneEls[i].innerHTML = `${q} <span class="mblock-unit">waiting</span>`;
+        animateMblock(document.getElementById(`mblock-co${i}`));
+        prevCounts[i] = q;
+      }
     }
-    renderExtraCheckouts();
-    
-    // Update real queues — animate the parent mblock when count changes
-    const q1 = m.queue1 ?? 0;
-    const q2 = m.queue2 ?? 0;
-    if (q1 !== prevCounts[1]) {
-      $lane1.innerHTML = `${q1} <span class="mblock-unit">waiting</span>`;
-      prevCounts[1] = q1;
+
+    // Clear alert highlight when count drops below threshold
+    for (const lane of alertedCheckouts) {
+      if (counts[lane] < 4) setCheckoutAlert(lane, false);
     }
-    if (q2 !== prevCounts[2]) {
-      $lane2.innerHTML = `${q2} <span class="mblock-unit">waiting</span>`;
-      prevCounts[2] = q2;
-    }
-    
-    // Update wait times
+
+    // Update sub-labels for lanes 3 & 4
+    const lane3Sub = document.getElementById("m-lane3-sub");
+    const lane4Sub = document.getElementById("m-lane4-sub");
+    if (lane3Sub) lane3Sub.textContent = checkoutCount >= 3 ? "active" : "closed";
+    if (lane4Sub) lane4Sub.textContent = checkoutCount >= 4 ? "active" : "closed";
+
+    // Update avg wait times for lanes 1 & 2
     const lane1Sub = document.getElementById("m-lane1-sub");
     const lane2Sub = document.getElementById("m-lane2-sub");
-    
-    if (m.queue1_avg_wait !== null) {
+    if (m.queue1_avg_wait !== null && m.queue1_avg_wait !== undefined) {
       lane1Sub.textContent = `avg wait ${m.queue1_avg_wait.toFixed(1)}s`;
       lastQueue1Wait = m.queue1_avg_wait;
     } else {
       lane1Sub.textContent = "avg wait —";
       lastQueue1Wait = null;
     }
-    
-    if (m.queue2_avg_wait !== null) {
+    if (m.queue2_avg_wait !== null && m.queue2_avg_wait !== undefined) {
       lane2Sub.textContent = `avg wait ${m.queue2_avg_wait.toFixed(1)}s`;
       lastQueue2Wait = m.queue2_avg_wait;
     } else {
       lane2Sub.textContent = "avg wait —";
       lastQueue2Wait = null;
     }
-    
-    // Calculate and display total average wait
+
+    // Total average wait across all open lanes
     let totalWait = "—";
     if (lastQueue1Wait !== null && lastQueue2Wait !== null) {
       totalWait = ((lastQueue1Wait + lastQueue2Wait) / 2).toFixed(1);
@@ -141,8 +132,8 @@ async function pollMetrics() {
       totalWait = lastQueue2Wait.toFixed(1);
     }
     $totalWait.innerHTML = `${totalWait} <span class="mblock-unit">seconds</span>`;
-    
-    $store.textContent  = m.store_count ?? m.clients_visible ?? 0;
+
+    $store.textContent  = resolveStoreCount(m);
     $status.textContent = m.status || "MONITORING";
 
     const isAlert = m.status === "ALERT";
@@ -152,6 +143,15 @@ async function pollMetrics() {
 }
 pollMetrics();
 setInterval(pollMetrics, 1500);
+
+// ── Checkout alert highlight ─────────────────────────────────────────────
+function setCheckoutAlert(lane, active) {
+  const el = document.getElementById(`mblock-co${lane}`);
+  if (!el) return;
+  el.classList.toggle("mblock-alert", active);
+  if (active) alertedCheckouts.add(lane);
+  else alertedCheckouts.delete(lane);
+}
 
 // ── SSE: agent events ───────────────────────────────────────────────────
 function connectSSE() {
@@ -163,6 +163,14 @@ function connectSSE() {
 
     if (data.type === "queue_alert") {
       addCvAlertCard(data);
+      setCheckoutAlert(data.lane, true);
+      eventCount++;
+      $eventCount.textContent = `${eventCount} event${eventCount !== 1 ? "s" : ""}`;
+      return;
+    }
+
+    if (data.type === "close_alert") {
+      addCloseAlertCard(data);
       eventCount++;
       $eventCount.textContent = `${eventCount} event${eventCount !== 1 ? "s" : ""}`;
       return;
@@ -178,8 +186,6 @@ function connectSSE() {
 
     if (data.type === "scheduled_llm_call") {
       addScheduledCard(data);
-      eventCount++;
-      $eventCount.textContent = `${eventCount} event${eventCount !== 1 ? "s" : ""}`;
     }
   };
 
@@ -213,8 +219,8 @@ function addCvAlertCard(data) {
 
   card.innerHTML = `
     <div class="card-top">
+      <span class="event-badge event-badge-cv">EVENT</span>
       <span class="card-time">${esc(data.timestamp || "")}</span>
-      <span class="event-badge event-badge-cv">CV ALERT</span>
     </div>
     <div class="card-field">
       <div class="card-field-label">Alert</div>
@@ -230,22 +236,55 @@ function addCvAlertCard(data) {
   prependAndTrim(card);
 }
 
+function addCloseAlertCard(data) {
+  const card = document.createElement("div");
+  card.className = "card card-event-close";
+  const alertId = data.alert_id || `close-${Date.now()}`;
+  card.dataset.alertId = alertId;
+  card.dataset.alertMessage = data.message || `Checkout ${data.lane || "?"} underutilised`;
+
+  card.innerHTML = `
+    <div class="card-top">
+      <span class="event-badge event-badge-close">CLOSE SUGGESTION</span>
+      <span class="card-time">${esc(data.timestamp || "")}</span>
+    </div>
+    <div class="card-field">
+      <div class="card-field-label">Alert</div>
+      <div class="card-field-value">${esc(card.dataset.alertMessage)}</div>
+    </div>
+    <div class="card-field">
+      <div class="card-field-label">LLM Call</div>
+      <div class="card-field-value card-pending">Waiting for decision...</div>
+    </div>
+  `;
+
+  pendingCvCards.set(alertId, card);
+  prependAndTrim(card);
+}
+
+function decisionClass(action) {
+  const a = (action || "none").toLowerCase();
+  if (a.includes("open_register"))  return "card-decision-open";
+  if (a.includes("close_register")) return "card-decision-close";
+  return "card-decision-none";
+}
+
 function updateCvAlertWithDecision(data) {
   const alertId = data.alert_id;
   const card = alertId ? pendingCvCards.get(alertId) : null;
   const alertMessage = card ? card.dataset.alertMessage : null;
 
   if (!card) {
-    // Fallback: if unmatched, still render as CV decision card.
     const fallback = document.createElement("div");
-    fallback.className = "card card-event-cv";
-    fallback.innerHTML = buildDecisionBody("CV ALERT", "event-badge-cv", data, null);
+    fallback.className = `card ${decisionClass(data.action)}`;
+    fallback.innerHTML = buildDecisionBody("EVENT", "event-badge-cv", data, null);
     prependAndTrim(fallback);
     startWhyTypewriter(fallback, data);
     return;
   }
 
-  card.innerHTML = buildDecisionBody("CV ALERT", "event-badge-cv", data, alertMessage);
+  card.className = `card ${decisionClass(data.action)}`;
+  card.innerHTML = buildDecisionBody("EVENT", "event-badge-cv", data, alertMessage);
   pendingCvCards.delete(alertId);
   startWhyTypewriter(card, data);
 }
@@ -253,9 +292,21 @@ function updateCvAlertWithDecision(data) {
 function addScheduledCard(data) {
   const card = document.createElement("div");
   card.className = "card card-event-scheduled";
-  card.innerHTML = buildDecisionBody("SCHEDULED", "event-badge-scheduled", data, null);
+  card.innerHTML = `
+    <div class="card-top">
+      <span class="event-badge event-badge-scheduled">SCHEDULED</span>
+      <span class="card-time">${esc(data.timestamp || "")}</span>
+    </div>
+    <div class="card-field">
+      <div class="card-field-label">Trend Report</div>
+      <div class="card-field-value card-report-value"></div>
+    </div>
+  `;
   prependAndTrim(card);
-  startWhyTypewriter(card, data);
+  const reportEl = card.querySelector(".card-report-value");
+  if (reportEl) typewriter(reportEl, data.report || "No report available.");
+  eventCount++;
+  $eventCount.textContent = `${eventCount} event${eventCount !== 1 ? "s" : ""}`;
 }
 
 function startWhyTypewriter(card, data) {
@@ -265,42 +316,32 @@ function startWhyTypewriter(card, data) {
   }
 }
 
+function actionLabel(action) {
+  const a = (action || "none").toLowerCase();
+  if (a.includes("open_register"))  return { text: "Opening Checkout", cls: "decision-label-open" };
+  if (a.includes("close_register")) return { text: "Closing Checkout", cls: "decision-label-close" };
+  return { text: "No Action Taken",        cls: "decision-label-none" };
+}
+
 function buildDecisionBody(label, badgeClass, data, alertMessage) {
-  const action = data.action && data.action.toLowerCase() !== "none" ? data.action : "none";
   const metrics = data.metrics || {};
+  const { text: decisionText, cls: decisionCls } = actionLabel(data.action);
   return `
     <div class="card-top">
-      <span class="card-time">${esc(data.timestamp || "")}</span>
       <span class="event-badge ${badgeClass}">${label}</span>
+      <span class="card-time">${esc(data.timestamp || "")}</span>
     </div>
     ${alertMessage ? `
     <div class="card-field card-field-alert">
       <div class="card-field-label">Alert</div>
       <div class="card-field-value">${esc(alertMessage)}</div>
     </div>` : ""}
+    <div class="decision-label ${decisionCls}">${decisionText}</div>
     <div class="card-field">
-      <div class="card-field-label">Input Params</div>
-      <div class="card-metrics-inline">
-        <span class="param-chip">Q1 ${num(metrics.queue1)}</span>
-        <span class="param-chip">Q2 ${num(metrics.queue2)}</span>
-        <span class="param-chip">Q3 ${num(metrics.queue3)}</span>
-        <span class="param-chip">Q4 ${num(metrics.queue4)}</span>
-        <span class="param-chip param-chip-sep">|</span>
-        <span class="param-chip">Avg Q1 ${metrics.queue1_avg_wait != null ? metrics.queue1_avg_wait.toFixed(1) + "s" : "—"}</span>
-        <span class="param-chip">Avg Q2 ${metrics.queue2_avg_wait != null ? metrics.queue2_avg_wait.toFixed(1) + "s" : "—"}</span>
-        <span class="param-chip param-chip-sep">|</span>
-        <span class="param-chip">Client in Store ${num(metrics.store_count)}</span>
-        <span class="param-chip">Open Checkouts ${num(metrics.checkouts_open)}</span>
-      </div>
+    <div class="card-field-label">Why</div>
+    <div class="card-field-value card-why-value"></div>
     </div>
     <div class="card-field">
-      <div class="card-field-label">Decision</div>
-      <div class="card-field-value"><strong>${esc(action)}</strong></div>
-    </div>
-    <div class="card-field">
-      <div class="card-field-label">Why</div>
-      <div class="card-field-value card-why-value"></div>
-    </div>
   `;
 }
 
@@ -348,6 +389,37 @@ function showPopup(data) {
       $popup.classList.remove("popup-exit");
     }, 300);
   }, 4000);
+}
+
+// ── Debug reset (Shift + R) ──────────────────────────────────────────────
+document.addEventListener("keydown", async (e) => {
+  if (e.key === "R" && e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    await fetch("/reset", { method: "POST" });
+    // Reset local frontend state
+    prevCounts = { 1: -1, 2: -1, 3: -1, 4: -1 };
+    checkoutCount = 2;
+    updateCheckoutDots(2);
+    $cards.innerHTML = "";
+    pendingCvCards.clear();
+    eventCount = 0;
+    $eventCount.textContent = "0 events";
+    showResetToast();
+  }
+});
+
+function showResetToast() {
+  let toast = document.getElementById("reset-toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "reset-toast";
+    document.body.appendChild(toast);
+  }
+  toast.textContent = "RESET";
+  toast.classList.remove("toast-hide");
+  toast.classList.add("toast-show");
+  setTimeout(() => {
+    toast.classList.replace("toast-show", "toast-hide");
+  }, 1200);
 }
 
 // ── Utility ─────────────────────────────────────────────────────────────

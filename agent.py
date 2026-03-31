@@ -100,19 +100,36 @@ Available tools:
 CURRENT STATE:
 - Lane 1 & 2: Detected by CV (real queue counts)
 - Checkout 3 & 4: Dynamically opened/closed by you (simulated queue counts)
-- checkouts_open: Total number of active checkouts (2-4 range)
+- checkouts_open: Total number of active checkouts (1-4 range, minimum 1)
+
+DECISION PRIORITY — follow this order strictly:
+1. PEOPLE COUNT FIRST: Base every open/close decision primarily on the current number
+   of people in each lane. This is the most reliable signal.
+   - 0 people → lane should be closed (free up staff)
+   - 1-2 people → normal, no action needed
+   - 3-4 people → busy, monitor the trend
+   - 5+ people → open a new register if possible
+2. AVERAGE WAIT TIME SECOND: Only relevant for OPENING decisions, never for CLOSING.
+   - For closing: ignore avg_wait entirely — a lane with 0-2 people should be closed
+     regardless of past wait times. Historical wait averages do not justify keeping
+     an underutilised lane open.
+   - For opening: use avg_wait as a secondary tiebreaker only when queue counts are
+     borderline (3-4 people and growing).
+3. CUSTOMERS IN STORE is a weak signal — ignore it for most decisions. People
+   browsing the store are not yet in a queue. Only factor it in if queues are already
+   at 4+ people and the in-store count is very high (30+), suggesting a wave is coming.
+   A store with 10-20 people and empty queues means checkouts can safely be reduced.
 
 RULES:
 - Do NOT act every cycle. Only act when genuinely necessary.
-- Queue counts of 0-2 per lane are normal. 3-4 is busy. 5+ needs action.
 - Growing trends with 4+ people warrant opening a register (if under 4 total).
-- Only alert the supervisor for truly unusual or urgent situations.
-- If nothing notable is happening, say so and set urgency to low.
 - Keep responses concise — one sentence per field.
 - If last_action_taken shows a register was opened recently, assume the queue is
   already being addressed and avoid opening another one. Queues take time to drain.
 - NEVER call open_register if can_open_more is false or checkouts_open is already 4. This is a hard limit.
-- Close registers if queues are empty and they're underutilized.
+- NEVER call close_register if checkouts_open is already 1. This is a hard limit.
+- Close a register if its queue is 0-1 people AND the other open lanes are not overloaded (no lane above 4 people). Avg wait time is irrelevant for this decision.
+- Do NOT close a lane if doing so would leave the remaining lanes struggling (any lane at 4+ people).
 
 Respond in EXACTLY this format (no extra text):
 SITUATION: <one sentence>
@@ -167,6 +184,9 @@ def analyze_node(state: AgentState) -> dict:
         f'  "last_action_taken": {last_action_str}\n'
         f"}}"
     )
+    close_hint = m.get("_close_hint")
+    if close_hint:
+        human_msg += f"\n\nTRIGGER: {close_hint} Do NOT open a register. Decide whether to close one."
     try:
         import os
         ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")

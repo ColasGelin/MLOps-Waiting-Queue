@@ -49,6 +49,11 @@ ALERT_DURATION       = 3.0   # seconds the threshold must be held before alert f
 ALERT_COOLDOWN       = 20.0  # seconds before a new alert can fire globally
 POST_ACTION_COOLDOWN = 20.0  # seconds to suppress alerts after a tool action
 
+CLOSE_LANE_MAX       = 2     # a lane with ≤ this many people is underutilised
+CLOSE_TOTAL_MAX      = 8     # total people across all lanes must be ≤ this
+CLOSE_DURATION       = 10.0  # seconds the condition must hold before alert fires
+CLOSE_COOLDOWN       = 40.0  # seconds between close-checkout alerts
+
 # ── Shared state ─────────────────────────────────────────────────────────────
 
 # Thread-safe queue for SSE events (agent decisions)
@@ -169,6 +174,7 @@ class DetectorState:
         self.lock = threading.Lock()
         self.latest_jpeg = None
         self.stop_event = threading.Event()
+        self.reset_event = threading.Event()
 
 
 def detector_worker(state: DetectorState):
@@ -196,16 +202,45 @@ def detector_worker(state: DetectorState):
         q1_history = []
         q2_history = []
 
+        # Rolling average for frame processing time (last 30 frames)
+        frame_ms_history = []
+
         # Alert state: high_since per lane, single global cooldown + counter
         lane_alert = [{"high_since": None}, {"high_since": None}]
         last_global_alert = 0.0
         alert_counter = 0
+
+        # Close-checkout alert state — tracked per lane (0.0 = not active)
+        close_alert_lane: dict[int, float] = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+        last_close_alert = 0.0
 
         with metrics_lock:
             latest_metrics["total_frames"] = total_frames
             latest_metrics["status"] = "running"
 
         while not state.stop_event.is_set():
+            # ── Debug reset ──────────────────────────────────────────────────
+            if state.reset_event.is_set():
+                state.reset_event.clear()
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                frame_idx = 0
+                proc_t0 = time.time()
+                tracker = BYTETracker(TRACKER_ARGS, frame_rate=30)
+                registry = TrackRegistry(video_fps)
+                zone_dwell = [{}, {}]
+                zone_entry_frame = [{}, {}]
+                zone_completed_waits = [[], []]
+                q1_history = []
+                q2_history = []
+                frame_ms_history = []
+                lane_alert = [{"high_since": None}, {"high_since": None}]
+                last_global_alert = 0.0
+                alert_counter = 0
+                close_alert_lane = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+                last_close_alert = 0.0
+                with metrics_lock:
+                    latest_metrics["status"] = "running"
+
             ret, frame = cap.read()
             if not ret:
                 if state.loop_video:
@@ -308,9 +343,9 @@ def detector_worker(state: DetectorState):
                             "lane": lane_num,
                             "count": count,
                             "timestamp": time.strftime("%H:%M:%S"),
-                            "message": f"Lane {lane_num} has {count} people waiting.",
+                            "message": f"Checkout #{lane_num} has {count} people waiting.",
                         })
-                        log_event(f"Alert fired — Lane {lane_num}: {count} people")
+                        log_event(f"Alert fired — Checkout {lane_num}: {count} people")
                         with metrics_lock:
                             snapshot = dict(latest_metrics)
                         snapshot["_alert_id"] = aid
@@ -321,6 +356,54 @@ def detector_worker(state: DetectorState):
                         last_global_alert = now_t
                 else:
                     lane_state["high_since"] = None
+
+            # ── Close-checkout alert ─────────────────────────────────────────
+            # Check every open lane individually; suggest closing if it is
+            # nearly empty and the total queue load is low enough.
+            with metrics_lock:
+                checkouts_now    = latest_metrics["checkouts_open"]
+                q3               = latest_metrics["queue3"]
+                q4               = latest_metrics["queue4"]
+                last_action_time = latest_metrics["last_action_time"]
+
+            all_counts = {1: q1_count, 2: q2_count, 3: q3, 4: q4}
+            total_q    = sum(all_counts[i] for i in range(1, checkouts_now + 1))
+
+            for lane in range(1, checkouts_now + 1):
+                count = all_counts[lane]
+                cooldowns_ok = now_t - last_action_time >= POST_ACTION_COOLDOWN
+                if count <= CLOSE_LANE_MAX and total_q <= CLOSE_TOTAL_MAX and cooldowns_ok:
+                    if close_alert_lane[lane] == 0.0:
+                        close_alert_lane[lane] = now_t
+                    elif now_t - close_alert_lane[lane] >= CLOSE_DURATION:
+                        with agent_busy_lock:
+                            busy = agent_busy
+                        if not busy:
+                            alert_counter += 1
+                            aid = f"alert-{alert_counter}"
+                            broadcast_event({
+                                "type":      "close_alert",
+                                "alert_id":  aid,
+                                "lane":      lane,
+                                "count":     count,
+                                "total":     total_q,
+                                "timestamp": time.strftime("%H:%M:%S"),
+                                "message":   f"Checkout {lane} has only {count} waiting — total load is {total_q}. Consider closing.",
+                            })
+                            log_event(f"Close alert — Checkout {lane}: {count} people, total {total_q}")
+                            with metrics_lock:
+                                snapshot = dict(latest_metrics)
+                            snapshot["_alert_id"]   = aid
+                            snapshot["_alert_type"] = "close"
+                            snapshot["_alert_lane"] = lane
+                            snapshot["_alert_count"] = count
+                            try:
+                                urgent_queue.put_nowait(snapshot)
+                            except queue.Full:
+                                pass
+                            close_alert_lane[lane] = 0.0
+                else:
+                    close_alert_lane[lane] = 0.0
 
             # Avg waits
             q1_avg, q2_avg = None, None
@@ -381,15 +464,31 @@ def detector_worker(state: DetectorState):
                 avg_waits.append(q2_avg)
             if not queue_counts:
                 queue_counts.append(("Clients", len(visible)))
-            draw_hud(frame, employee_count, video_fps, queue_counts, avg_waits)
+
+            # Top-left render time overlay
+            frame_ms = (time.time() - frame_start) * 1000
+            frame_ms_history.append(frame_ms)
+            if len(frame_ms_history) > 30:
+                frame_ms_history.pop(0)
+            avg_ms = sum(frame_ms_history) / len(frame_ms_history)
+            now = time.time()
+            processing_fps = frame_idx / max(1e-6, now - proc_t0)
+            lines_hud = [f"avg: {avg_ms:.1f}ms", f"fps: {processing_fps:.1f}"]
+            font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1
+            pad, line_h = 20, 26
+            sizes = [cv2.getTextSize(l, font, scale, thick)[0] for l in lines_hud]
+            box_w = max(s[0] for s in sizes) + pad * 2
+            box_h = pad * 2 + line_h * len(lines_hud)
+            cv2.rectangle(frame, (0, 0), (box_w, box_h), (0, 0, 0), -1)
+            for i, line in enumerate(lines_hud):
+                cv2.putText(frame, line, (pad, pad + line_h * i + 14),
+                            font, scale, (200, 200, 200), thick, cv2.LINE_AA)
 
             # Encode JPEG
             ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             if not ok:
                 continue
 
-            now = time.time()
-            processing_fps = frame_idx / max(1e-6, now - proc_t0)
 
             with state.lock:
                 state.latest_jpeg = jpeg.tobytes()
@@ -441,15 +540,62 @@ def agent_worker(stop_event: threading.Event):
         except queue.Empty:
             continue
 
-        alert_id = snapshot.pop("_alert_id", None)
+        alert_id    = snapshot.pop("_alert_id", None)
+        alert_type  = snapshot.pop("_alert_type", None)
+        alert_lane  = snapshot.pop("_alert_lane", None)
+        alert_count = snapshot.pop("_alert_count", None)
 
         with agent_busy_lock:
             global agent_busy
             agent_busy = True
 
-        print(f"[AGENT] Calling agent — Q1:{snapshot.get('queue1',0)} "
-              f"Q2:{snapshot.get('queue2',0)} Store:{snapshot.get('store_count',0)}")
-        result = run_agent(snapshot)
+        # Deterministic shortcut: lanes with 0-1 people are always closed —
+        # no LLM reasoning needed, and minimum-1 guard is enforced inline.
+        if alert_type == "close" and alert_lane is not None and alert_count is not None and alert_count <= 1:
+            print(f"[AGENT] Deterministic close — lane {alert_lane} has {alert_count} people")
+            with metrics_lock:
+                if latest_metrics["checkouts_open"] <= 1:
+                    tool_result = "Cannot close: already at minimum 1 checkout."
+                else:
+                    latest_metrics["checkouts_open"] -= 1
+                    for checkout_num in (3, 4):
+                        if latest_metrics["checkouts_open"] < checkout_num:
+                            extra_checkout_state[checkout_num]["count"] = 0
+                            extra_checkout_state[checkout_num]["trend"] = 1
+                            latest_metrics[f"queue{checkout_num}"] = 0
+                    latest_metrics["last_action"] = f"close_register({alert_lane})"
+                    latest_metrics["last_action_time"] = time.time()
+                    total_open = latest_metrics["checkouts_open"]
+                    log_event(f"Checkout closed (lane {alert_lane}) — Total: {total_open}")
+                    tool_result = (f"Register at lane {alert_lane} is now CLOSED. "
+                                   f"Total checkouts: {total_open}")
+            result = {
+                "situation": f"Lane {alert_lane} has only {alert_count} people and overall load is low.",
+                "reasoning": "Closing an underutilised lane when other lanes can handle the remaining load.",
+                "action":    f"close_register({alert_lane})",
+                "urgency":   "low",
+                "tool_result": tool_result,
+                "timestamp": time.strftime("%H:%M:%S"),
+                "raw":       "",
+            }
+        else:
+            # Pass alert context into snapshot so the LLM knows why it was triggered
+            if alert_type == "close" and alert_lane is not None:
+                snapshot["_close_hint"] = (f"CLOSE ALERT: lane {alert_lane} has only "
+                                           f"{alert_count} people. Consider closing it.")
+            print(f"[AGENT] Calling agent — Q1:{snapshot.get('queue1',0)} "
+                  f"Q2:{snapshot.get('queue2',0)} Store:{snapshot.get('store_count',0)}")
+            result = run_agent(snapshot)
+
+        # Hard guard: veto open_register if already at max, regardless of what the LLM decided
+        if "open_register" in result.get("action", "").lower():
+            with metrics_lock:
+                current_open = latest_metrics["checkouts_open"]
+            if current_open >= 4:
+                print(f"[AGENT] Vetoed open_register — already at {current_open} checkouts")
+                result["action"] = "none"
+                result["tool_result"] = "Vetoed: already at maximum 4 checkouts."
+
         print(f"[AGENT] {result.get('urgency','?').upper()} — {result.get('situation','')}")
 
         # Log the action taken (tool calls update metrics via /add_checkout or /remove_checkout)
@@ -501,35 +647,15 @@ def report_worker(stop_event: threading.Event):
             stop_event.wait(60)
             continue
 
-        print("[SCHEDULED] Running 60s LLM check...")
-        result = run_agent(snapshot)
-        print(f"[SCHEDULED] {result.get('urgency', '?').upper()} — {result.get('situation', '')}")
-
-        action = result.get("action", "none").lower()
-        if "open_register" in action or "close_register" in action:
-            log_event(f"Scheduled action taken: {result.get('action', 'none')}")
+        print("[SCHEDULED] Running 60s trend report...")
+        report_text = run_report(snapshot, log_copy)
+        print(f"[SCHEDULED] Report: {report_text[:80]}...")
 
         broadcast_event({
-            "type": "scheduled_llm_call",
-            "trigger": "scheduled",
-            "timestamp": result.get("timestamp", time.strftime("%H:%M:%S")),
-            "situation": result.get("situation", ""),
-            "reasoning": result.get("reasoning", ""),
-            "action": result.get("action", "none"),
-            "urgency": result.get("urgency", "low"),
-            "tool_result": result.get("tool_result"),
-            "metrics": {
-                "queue1":          snapshot.get("queue1", 0),
-                "queue2":          snapshot.get("queue2", 0),
-                "queue3":          snapshot.get("queue3", 0),
-                "queue4":          snapshot.get("queue4", 0),
-                "store_count":     snapshot.get("store_count", 0),
-                "checkouts_open":  snapshot.get("checkouts_open", 2),
-                "queue1_avg_wait": snapshot.get("queue1_avg_wait"),
-                "queue2_avg_wait": snapshot.get("queue2_avg_wait"),
-                "queue1_trend":    snapshot.get("queue1_trend", "stable"),
-                "queue2_trend":    snapshot.get("queue2_trend", "stable"),
-            },
+            "type":      "scheduled_llm_call",
+            "trigger":   "scheduled",
+            "timestamp": time.strftime("%H:%M:%S"),
+            "report":    report_text,
         })
         stop_event.wait(60)
 
@@ -592,6 +718,31 @@ def create_app(det_state: DetectorState):
         with metrics_lock:
             return jsonify(dict(latest_metrics))
 
+    @app.route("/reset", methods=["POST"])
+    def reset():
+        """Debug reset: seek video to frame 0 and reinitialise all state."""
+        det_state.reset_event.set()
+        with metrics_lock:
+            latest_metrics.update({
+                "queue1": 0, "queue2": 0,
+                "queue1_avg_wait": None, "queue2_avg_wait": None,
+                "queue1_trend": "stable", "queue2_trend": "stable",
+                "queue3": 0, "queue4": 0,
+                "employees": 0, "clients_visible": 0, "store_count": 0,
+                "checkouts_open": 2,
+                "last_action": None, "last_action_time": 0.0,
+                "status": "resetting",
+            })
+        for num in (3, 4):
+            extra_checkout_state[num].update({"count": 0, "trend": 1, "next_update": 0.0})
+        while not urgent_queue.empty():
+            try: urgent_queue.get_nowait()
+            except queue.Empty: break
+        with minute_log_lock:
+            minute_log.clear()
+        broadcast_event({"type": "reset", "timestamp": time.strftime("%H:%M:%S")})
+        return jsonify({"ok": True})
+
     @app.route("/add_checkout", methods=["POST"])
     def add_checkout():
         """Open a new checkout (tool call from agent)."""
@@ -632,11 +783,11 @@ def create_app(det_state: DetectorState):
         lane_id = data.get("lane_id")
         
         with metrics_lock:
-            # Ensure we don't go below 2 (the base checkouts)
-            min_checkouts = 2
+            # Ensure we don't go below 1
+            min_checkouts = 1
             if latest_metrics["checkouts_open"] <= min_checkouts:
                 return jsonify({
-                    "error": f"Minimum {min_checkouts} checkouts must stay open",
+                    "error": f"Minimum {min_checkouts} checkout must stay open",
                     "checkouts_open": latest_metrics["checkouts_open"]
                 }), 409
             
