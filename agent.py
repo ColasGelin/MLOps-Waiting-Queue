@@ -3,14 +3,19 @@ LangGraph Agent — Queue Management Decision Maker
 Uses Ollama (llama3.1) to analyze queue metrics and decide actions.
 """
 
+import os
 import re
 import time
 from typing import Optional, TypedDict
 
+import requests
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
+
+# Get the Flask server base URL from env, default to localhost
+FLASK_BASE_URL = os.environ.get("FLASK_BASE_URL", "http://localhost:8000")
 
 
 # ── Tools ────────────────────────────────────────────────────────────────────
@@ -18,13 +23,37 @@ from langgraph.graph import END, START, StateGraph
 @tool
 def open_register(lane_id: int) -> str:
     """Open a checkout register for the specified lane."""
-    return f"Register at lane {lane_id} is now OPEN. Cashier dispatched."
+    try:
+        response = requests.post(
+            f"{FLASK_BASE_URL}/add_checkout",
+            json={"lane_id": lane_id},
+            timeout=5
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return f"Register at lane {lane_id} is now OPEN. Total checkouts: {data.get('checkouts_open', '?')}"
+        else:
+            return f"Failed to open register: {response.status_code}"
+    except Exception as e:
+        return f"Error opening register: {str(e)}"
 
 
 @tool
 def close_register(lane_id: int) -> str:
     """Close a checkout register for the specified lane."""
-    return f"Register at lane {lane_id} is now CLOSED."
+    try:
+        response = requests.post(
+            f"{FLASK_BASE_URL}/remove_checkout",
+            json={"lane_id": lane_id},
+            timeout=5
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return f"Register at lane {lane_id} is now CLOSED. Total checkouts: {data.get('checkouts_open', '?')}"
+        else:
+            return f"Failed to close register: {response.status_code}"
+    except Exception as e:
+        return f"Error closing register: {str(e)}"
 
 
 @tool
@@ -56,19 +85,28 @@ You are an AI queue management agent monitoring a supermarket checkout area in r
 You receive queue metrics every 5 seconds and must decide if any action is needed.
 
 Available tools:
-  open_register(lane_id)        — open a new checkout lane
+  open_register(lane_id)        — open a new checkout lane (max 4 total)
   close_register(lane_id)       — close an idle checkout lane
   alert_supervisor(message, urgency) — page the floor supervisor
   flag_anomaly(description)     — flag unusual activity for review
   generate_shift_report()       — create a shift summary
 
+CURRENT STATE:
+- Lane 1 & 2: Detected by CV (real queue counts)
+- Checkout 3 & 4: Dynamically opened/closed by you (simulated queue counts)
+- checkouts_open: Total number of active checkouts (2-4 range)
+
 RULES:
 - Do NOT act every cycle. Only act when genuinely necessary.
 - Queue counts of 0-2 per lane are normal. 3-4 is busy. 5+ needs action.
-- Growing trends with 4+ people warrant opening a register.
+- Growing trends with 4+ people warrant opening a register (if under 4 total).
 - Only alert the supervisor for truly unusual or urgent situations.
 - If nothing notable is happening, say so and set urgency to low.
 - Keep responses concise — one sentence per field.
+- If last_action_taken shows a register was opened recently, assume the queue is
+  already being addressed and avoid opening another one. Queues take time to drain.
+- NEVER exceed 4 open checkouts total. Check the checkouts_open field first.
+- Close registers if queues are empty and they're underutilized.
 
 Respond in EXACTLY this format (no extra text):
 SITUATION: <one sentence>
@@ -93,14 +131,29 @@ class AgentState(TypedDict):
 def analyze_node(state: AgentState) -> dict:
     """Call the LLM with current metrics."""
     m = state["metrics"]
+    last_action = m.get("last_action")
+    last_action_time = m.get("last_action_time", 0.0)
+    last_action_str = "null"
+    if last_action and last_action.lower() not in ("none", "no action", ""):
+        elapsed = int(time.time() - last_action_time)
+        last_action_str = f'"{last_action} ({elapsed}s ago)"'
+
     human_msg = (
-        f"Current queue metrics:\n"
-        f"- Lane 1: {m.get('queue1', 0)} people (trend: {m.get('queue1_trend', 'stable')})\n"
-        f"- Lane 2: {m.get('queue2', 0)} people (trend: {m.get('queue2_trend', 'stable')})\n"
-        f"- Total in store: {m.get('store_count', 0)}\n"
-        f"- Employees visible: {m.get('employees', 0)}\n"
-        f"- Avg wait Lane 1: {_fmt_wait(m.get('queue1_avg_wait'))}\n"
-        f"- Avg wait Lane 2: {_fmt_wait(m.get('queue2_avg_wait'))}\n"
+        f"Current queue metrics (JSON snapshot):\n"
+        f"{{\n"
+        f'  "lane_1_people": {m.get("queue1", 0)},\n'
+        f'  "lane_1_trend": "{m.get("queue1_trend", "stable")}",\n'
+        f'  "lane_1_avg_wait_sec": {m.get("queue1_avg_wait") or "null"},\n'
+        f'  "lane_2_people": {m.get("queue2", 0)},\n'
+        f'  "lane_2_trend": "{m.get("queue2_trend", "stable")}",\n'
+        f'  "lane_2_avg_wait_sec": {m.get("queue2_avg_wait") or "null"},\n'
+        f'  "checkout_3_people": {m.get("queue3", 0)},\n'
+        f'  "checkout_4_people": {m.get("queue4", 0)},\n'
+        f'  "customers_in_store": {m.get("store_count", 0)},\n'
+        f'  "checkouts_open": {m.get("checkouts_open", 2)},\n'
+        f'  "employees_visible": {m.get("employees", 0)},\n'
+        f'  "last_action_taken": {last_action_str}\n'
+        f"}}"
     )
     try:
         import os
@@ -213,6 +266,56 @@ def _execute_tool(action_str: str) -> Optional[str]:
             return f"Tool {name} executed."
     except Exception as e:
         return f"Tool error: {e}"
+
+
+# ── Minute report ────────────────────────────────────────────────────────────
+
+REPORT_PROMPT = """\
+You are an AI queue management agent. Summarize the past minute of activity in a supermarket checkout area.
+You will receive current metrics and a log of events that occurred in the last 60 seconds.
+
+Write a 2-3 sentence operational summary covering:
+- Overall queue situation (busy, quiet, improving, worsening)
+- Any notable events or actions taken
+- A brief recommendation if anything needs attention
+
+Be concise and factual. Do not repeat raw numbers unless relevant.
+Respond with plain prose only — no headers, no bullet points, no formatting.
+"""
+
+def run_report(metrics: dict, event_log: list) -> str:
+    """Generate a plain-prose minute summary from current metrics + recent event log."""
+    m = metrics
+
+    last_action = m.get("last_action")
+    last_action_time = m.get("last_action_time", 0.0)
+    last_action_str = "none"
+    if last_action and last_action.lower() not in ("none", "no action", ""):
+        elapsed = int(time.time() - last_action_time)
+        last_action_str = f"{last_action} ({elapsed}s ago)"
+
+    log_text = "\n".join(f"  - {e}" for e in event_log) if event_log else "  - No alerts or actions."
+
+    human_msg = (
+        f"Current metrics:\n"
+        f"  Lane 1: {m.get('queue1', 0)} people ({m.get('queue1_trend', 'stable')})\n"
+        f"  Lane 2: {m.get('queue2', 0)} people ({m.get('queue2_trend', 'stable')})\n"
+        f"  In store: {m.get('store_count', 0)} | Checkouts open: {m.get('checkouts_open', 2)}\n"
+        f"  Avg wait L1: {_fmt_wait(m.get('queue1_avg_wait'))} | L2: {_fmt_wait(m.get('queue2_avg_wait'))}\n"
+        f"  Last action: {last_action_str}\n\n"
+        f"Events in the last 60 seconds:\n{log_text}"
+    )
+    try:
+        import os
+        ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        llm = ChatOllama(model="llama3.1", temperature=0.4, base_url=ollama_host)
+        response = llm.invoke([
+            SystemMessage(content=REPORT_PROMPT),
+            HumanMessage(content=human_msg),
+        ])
+        return response.content.strip()
+    except Exception as e:
+        return f"Report unavailable: {str(e)[:120]}"
 
 
 # ── Public API ───────────────────────────────────────────────────────────────

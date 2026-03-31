@@ -33,24 +33,52 @@
         <div id="popup" class="popup popup-hidden"></div>
       </div>
       <div class="metrics-bar">
-        <div class="metric-item">
-          <span class="metric-label">Lane 1</span>
-          <span class="metric-value" id="m-lane1">0</span>
-        </div>
-        <div class="metric-sep"></div>
-        <div class="metric-item">
-          <span class="metric-label">Lane 2</span>
-          <span class="metric-value" id="m-lane2">0</span>
-        </div>
-        <div class="metric-sep"></div>
-        <div class="metric-item">
-          <span class="metric-label">In Store</span>
-          <span class="metric-value" id="m-store">0</span>
-        </div>
-        <div class="metric-sep"></div>
-        <div class="metric-item status-item">
-          <span class="status-dot" id="status-dot"></span>
-          <span class="metric-value" id="m-status">MONITORING</span>
+        <div class="metrics-row" id="checkouts-row">
+
+          <!-- Checkout 1 & 2: real data from YOLO -->
+          <div class="mblock" id="mblock-co1">
+            <div class="mblock-label">Checkout 1</div>
+            <div class="mblock-main" id="m-lane1">0 <span class="mblock-unit">waiting</span></div>
+            <div class="mblock-sub" id="m-lane1-sub">avg wait —</div>
+          </div>
+
+          <div class="metric-sep"></div>
+
+          <div class="mblock" id="mblock-co2">
+            <div class="mblock-label">Checkout 2</div>
+            <div class="mblock-main" id="m-lane2">0 <span class="mblock-unit">waiting</span></div>
+            <div class="mblock-sub" id="m-lane2-sub">avg wait —</div>
+          </div>
+
+          <!-- Extra checkouts injected here by JS -->
+          <div id="extra-checkouts"></div>
+
+          <div class="metric-sep" id="sep-store"></div>
+
+          <div class="mblock">
+            <div class="mblock-label">Avg Wait</div>
+            <div class="mblock-main" id="m-total-wait">— <span class="mblock-unit">seconds</span></div>
+            <div class="mblock-sub">all queues</div>
+          </div>
+
+          <div class="metric-sep"></div>
+
+          <div class="mblock">
+            <div class="mblock-label">In Store</div>
+            <div class="mblock-main" id="m-store">0</div>
+            <div class="mblock-sub" id="m-trend">→ stable</div>
+          </div>
+
+          <div class="metric-sep"></div>
+
+          <div class="mblock mblock-status">
+            <div class="mblock-label">System</div>
+            <div class="mblock-main status-row">
+              <span class="status-dot" id="status-dot"></span>
+              <span id="m-status">MONITORING</span>
+            </div>
+          </div>
+
         </div>
       </div>
     </section>

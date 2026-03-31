@@ -394,6 +394,19 @@ def create_app(state):
         with state.lock:
             return jsonify(state.metrics)
 
+    @app.route("/video")
+    def stream_video():
+        def generate():
+            while not state.stop_event.is_set():
+                with state.lock:
+                    frame = state.latest_jpeg
+                if frame is None:
+                    time.sleep(0.05)
+                    continue
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+
+        return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
     @app.route("/stream.mjpg")
     def stream_mjpg():
         def generate():

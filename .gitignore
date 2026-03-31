@@ -2,3 +2,4 @@
 mvenv
 datasettopview/
 frames/
+__pycache__/

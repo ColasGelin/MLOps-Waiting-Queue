@@ -10,6 +10,7 @@ Usage:
 import argparse
 import json
 import queue
+import random
 import threading
 import time
 from datetime import datetime
@@ -17,11 +18,11 @@ from types import SimpleNamespace
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 from ultralytics import YOLO
 from ultralytics.trackers.byte_tracker import BYTETracker
 
-from agent import run_agent
+from agent import run_agent, run_report
 from detect import (
     BOX_COLOR,
     CLIENT_CLASS,
@@ -41,14 +42,34 @@ from detect import (
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-CONF_THRESH = 0.35
-ZONE_MIN_DWELL_SEC = 1.0
-AGENT_INTERVAL = 5  # seconds between agent calls
+CONF_THRESH          = 0.35
+ZONE_MIN_DWELL_SEC   = 1.0
+ALERT_THRESHOLD      = 5     # people in a lane to trigger alert
+ALERT_DURATION       = 3.0   # seconds the threshold must be held before alert fires
+ALERT_COOLDOWN       = 20.0  # seconds before a new alert can fire globally
+POST_ACTION_COOLDOWN = 20.0  # seconds to suppress alerts after a tool action
 
 # ── Shared state ─────────────────────────────────────────────────────────────
 
 # Thread-safe queue for SSE events (agent decisions)
 sse_queue = queue.Queue(maxsize=200)
+
+# Urgent trigger queue: detector pushes a metrics snapshot here when a
+# threshold alert fires so the agent worker calls the LLM immediately
+urgent_queue = queue.Queue(maxsize=5)
+
+# True while the agent is actively processing a request — blocks new alerts
+agent_busy = False
+agent_busy_lock = threading.Lock()
+
+# Rolling log of events for the minute report (entries are plain strings)
+minute_log = []
+minute_log_lock = threading.Lock()
+
+def log_event(msg: str):
+    """Append a timestamped entry to the rolling minute log."""
+    with minute_log_lock:
+        minute_log.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
 # List of SSE subscriber queues (one per connected client)
 sse_clients = []
@@ -62,15 +83,64 @@ latest_metrics = {
     "queue2_avg_wait": None,
     "queue1_trend": "stable",
     "queue2_trend": "stable",
+    "queue3": 0,         # Extra checkout 3 (simulated)
+    "queue4": 0,         # Extra checkout 4 (simulated)
     "employees": 0,
     "clients_visible": 0,
     "store_count": 0,
+    "checkouts_open": 2,
+    "last_action": None,       # e.g. "open_register(1)"
+    "last_action_time": 0.0,   # unix timestamp of last tool action
     "status": "initializing",
     "fps": 0.0,
     "frame": 0,
     "total_frames": 0,
 }
 metrics_lock = threading.Lock()
+
+# Simulated activity state for dynamic checkouts (3 and 4), backend-owned.
+extra_checkout_state = {
+    3: {"count": 0, "trend": 1},
+    4: {"count": 0, "trend": 1},
+}
+extra_checkout_last_update = 0.0
+
+
+def _update_extra_checkouts_locked(now_ts: float):
+    """Update queue3/queue4 every 5s; only open checkouts fluctuate, closed reset to 0."""
+    global extra_checkout_last_update
+    if now_ts - extra_checkout_last_update < 5.0:
+        return
+
+    open_count = int(latest_metrics.get("checkouts_open", 2))
+    for checkout_num in (3, 4):
+        state = extra_checkout_state[checkout_num]
+        is_open = open_count >= checkout_num
+        key = f"queue{checkout_num}"
+
+        if not is_open:
+            state["count"] = 0
+            state["trend"] = 1
+            latest_metrics[key] = 0
+            continue
+
+        if random.random() < 0.6:
+            state["trend"] = 1 if random.random() < 0.5 else -1
+
+        state["count"] += state["trend"]
+        if state["count"] < 0:
+            state["count"] = 0
+        if state["count"] > 5:
+            state["count"] = 5
+
+        if state["count"] == 0:
+            state["trend"] = 1
+        elif state["count"] == 5:
+            state["trend"] = -1
+
+        latest_metrics[key] = int(state["count"])
+
+    extra_checkout_last_update = now_ts
 
 
 def broadcast_event(event_data: dict):
@@ -128,6 +198,11 @@ def detector_worker(state: DetectorState):
         q1_history = []
         q2_history = []
 
+        # Alert state: high_since per lane, single global cooldown + counter
+        lane_alert = [{"high_since": None}, {"high_since": None}]
+        last_global_alert = 0.0
+        alert_counter = 0
+
         with metrics_lock:
             latest_metrics["total_frames"] = total_frames
             latest_metrics["status"] = "running"
@@ -150,6 +225,9 @@ def detector_worker(state: DetectorState):
 
             frame_idx += 1
             frame_start = time.time()
+
+            with metrics_lock:
+                _update_extra_checkouts_locked(frame_start)
 
             # Detection
             results = model(
@@ -206,6 +284,46 @@ def detector_worker(state: DetectorState):
             q1_count = sum(1 for _, f in zone_dwell[0].items() if f >= min_frames)
             q2_count = sum(1 for _, f in zone_dwell[1].items() if f >= min_frames)
 
+            # ── Threshold alerts ─────────────────────────────────────────────
+            now_t = time.time()
+            for lane_idx, count in enumerate([q1_count, q2_count]):
+                lane_state = lane_alert[lane_idx]
+                lane_num = lane_idx + 1
+                if count >= ALERT_THRESHOLD:
+                    if lane_state["high_since"] is None:
+                        lane_state["high_since"] = now_t
+                    elif (now_t - lane_state["high_since"] >= ALERT_DURATION
+                          and now_t - last_global_alert >= ALERT_COOLDOWN):
+                        # Skip if LLM is busy or a tool action was recently taken
+                        with agent_busy_lock:
+                            if agent_busy:
+                                continue
+                        with metrics_lock:
+                            last_action_time = latest_metrics["last_action_time"]
+                        if now_t - last_action_time < POST_ACTION_COOLDOWN:
+                            continue
+                        alert_counter += 1
+                        aid = f"alert-{alert_counter}"
+                        broadcast_event({
+                            "type": "queue_alert",
+                            "alert_id": aid,
+                            "lane": lane_num,
+                            "count": count,
+                            "timestamp": time.strftime("%H:%M:%S"),
+                            "message": f"Lane {lane_num} has {count} people waiting.",
+                        })
+                        log_event(f"Alert fired — Lane {lane_num}: {count} people")
+                        with metrics_lock:
+                            snapshot = dict(latest_metrics)
+                        snapshot["_alert_id"] = aid
+                        try:
+                            urgent_queue.put_nowait(snapshot)
+                        except queue.Full:
+                            pass
+                        last_global_alert = now_t
+                else:
+                    lane_state["high_since"] = None
+
             # Avg waits
             q1_avg, q2_avg = None, None
             if state.zone1 is not None:
@@ -236,8 +354,6 @@ def detector_worker(state: DetectorState):
             is_alert = q1_count >= 4 or q2_count >= 4 or q1_trend == "growing" or q2_trend == "growing"
 
             # Draw annotations
-            draw_zone(frame, state.zone1, ZONE_COLORS[0], "Queue 1")
-            draw_zone(frame, state.zone2, ZONE_COLORS[1], "Queue 2")
             for (x1, y1, x2, y2), cid in visible:
                 if zone_dwell[0].get(cid, 0) >= min_frames:
                     color = ZONE_COLORS[0]
@@ -315,33 +431,109 @@ def detector_worker(state: DetectorState):
 # ── Agent worker ─────────────────────────────────────────────────────────────
 
 def agent_worker(stop_event: threading.Event):
-    """Call the LangGraph agent every AGENT_INTERVAL seconds."""
+    """Call the LangGraph agent on a routine interval OR immediately when
+    the detector fires a threshold alert via urgent_queue."""
     time.sleep(3)  # let detector warm up
-    while not stop_event.is_set():
-        with metrics_lock:
-            snapshot = dict(latest_metrics)
 
-        if snapshot.get("status") not in ("running", "MONITORING", "ALERT"):
-            time.sleep(1)
+    while not stop_event.is_set():
+        # Only fire when an alert has triggered an urgent call
+        try:
+            snapshot = urgent_queue.get(timeout=1.0)
+            print("[AGENT] Urgent call triggered by queue alert")
+        except queue.Empty:
             continue
 
-        print(f"[AGENT] Calling agent — Q1:{snapshot['queue1']} Q2:{snapshot['queue2']} "
-              f"Store:{snapshot['store_count']}")
+        alert_id = snapshot.pop("_alert_id", None)
+
+        with agent_busy_lock:
+            global agent_busy
+            agent_busy = True
+
+        print(f"[AGENT] Calling agent — Q1:{snapshot.get('queue1',0)} "
+              f"Q2:{snapshot.get('queue2',0)} Store:{snapshot.get('store_count',0)}")
         result = run_agent(snapshot)
         print(f"[AGENT] {result.get('urgency','?').upper()} — {result.get('situation','')}")
 
-        event = {
+        # Log the action taken (tool calls update metrics via /add_checkout or /remove_checkout)
+        action = result.get("action", "none").lower()
+        if "open_register" in action or "close_register" in action:
+            log_event(f"Action taken: {result.get('action', 'none')}")
+
+        with agent_busy_lock:
+            agent_busy = False
+
+        broadcast_event({
             "type": "agent_decision",
+            "trigger": "cv_alert",
+            "alert_id": alert_id,
             "timestamp": result.get("timestamp", time.strftime("%H:%M:%S")),
             "situation": result.get("situation", ""),
             "reasoning": result.get("reasoning", ""),
             "action": result.get("action", "none"),
             "urgency": result.get("urgency", "low"),
             "tool_result": result.get("tool_result"),
-        }
-        broadcast_event(event)
+            "metrics": {
+                "queue1":          snapshot.get("queue1", 0),
+                "queue2":          snapshot.get("queue2", 0),
+                "queue3":          snapshot.get("queue3", 0),
+                "queue4":          snapshot.get("queue4", 0),
+                "store_count":     snapshot.get("store_count", 0),
+                "checkouts_open":  snapshot.get("checkouts_open", 2),
+                "queue1_avg_wait": snapshot.get("queue1_avg_wait"),
+                "queue2_avg_wait": snapshot.get("queue2_avg_wait"),
+                "queue1_trend":    snapshot.get("queue1_trend", "stable"),
+                "queue2_trend":    snapshot.get("queue2_trend", "stable"),
+            },
+        })
 
-        stop_event.wait(AGENT_INTERVAL)
+
+# ── Report worker ────────────────────────────────────────────────────────────
+
+def report_worker(stop_event: threading.Event):
+    """Every 60 seconds, run a scheduled LLM check and publish a blue event card."""
+    stop_event.wait(60)  # wait for first full minute
+    while not stop_event.is_set():
+        with metrics_lock:
+            snapshot = dict(latest_metrics)
+        with minute_log_lock:
+            log_copy = list(minute_log)
+            minute_log.clear()
+
+        if snapshot.get("status") not in ("running", "MONITORING", "ALERT"):
+            stop_event.wait(60)
+            continue
+
+        print("[SCHEDULED] Running 60s LLM check...")
+        result = run_agent(snapshot)
+        print(f"[SCHEDULED] {result.get('urgency', '?').upper()} — {result.get('situation', '')}")
+
+        action = result.get("action", "none").lower()
+        if "open_register" in action or "close_register" in action:
+            log_event(f"Scheduled action taken: {result.get('action', 'none')}")
+
+        broadcast_event({
+            "type": "scheduled_llm_call",
+            "trigger": "scheduled",
+            "timestamp": result.get("timestamp", time.strftime("%H:%M:%S")),
+            "situation": result.get("situation", ""),
+            "reasoning": result.get("reasoning", ""),
+            "action": result.get("action", "none"),
+            "urgency": result.get("urgency", "low"),
+            "tool_result": result.get("tool_result"),
+            "metrics": {
+                "queue1":          snapshot.get("queue1", 0),
+                "queue2":          snapshot.get("queue2", 0),
+                "queue3":          snapshot.get("queue3", 0),
+                "queue4":          snapshot.get("queue4", 0),
+                "store_count":     snapshot.get("store_count", 0),
+                "checkouts_open":  snapshot.get("checkouts_open", 2),
+                "queue1_avg_wait": snapshot.get("queue1_avg_wait"),
+                "queue2_avg_wait": snapshot.get("queue2_avg_wait"),
+                "queue1_trend":    snapshot.get("queue1_trend", "stable"),
+                "queue2_trend":    snapshot.get("queue2_trend", "stable"),
+            },
+        })
+        stop_event.wait(60)
 
 
 # ── Flask app ────────────────────────────────────────────────────────────────
@@ -364,7 +556,7 @@ def create_app(det_state: DetectorState):
                     continue
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
                 time.sleep(0.016)  # ~60fps cap to avoid flooding
-        return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+        return Response(stream_with_context(generate()), mimetype="multipart/x-mixed-replace; boundary=frame")
 
     @app.route("/events")
     def sse_stream():
@@ -385,7 +577,7 @@ def create_app(det_state: DetectorState):
                     if q in sse_clients:
                         sse_clients.remove(q)
 
-        return Response(generate(), mimetype="text/event-stream",
+        return Response(stream_with_context(generate()), mimetype="text/event-stream",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.route("/push_event", methods=["POST"])
@@ -401,6 +593,72 @@ def create_app(det_state: DetectorState):
     def metrics():
         with metrics_lock:
             return jsonify(dict(latest_metrics))
+
+    @app.route("/add_checkout", methods=["POST"])
+    def add_checkout():
+        """Open a new checkout (tool call from agent)."""
+        data = request.get_json(silent=True) or {}
+        lane_id = data.get("lane_id")
+        
+        with metrics_lock:
+            # Check if already at max (2 base + 2 extra = 4)
+            max_checkouts = 4
+            if latest_metrics["checkouts_open"] >= max_checkouts:
+                return jsonify({
+                    "error": f"Maximum {max_checkouts} checkouts already open",
+                    "checkouts_open": latest_metrics["checkouts_open"]
+                }), 409
+            
+            # Add new checkout
+            latest_metrics["checkouts_open"] += 1
+            opened_checkout = latest_metrics["checkouts_open"]
+            if opened_checkout in (3, 4):
+                extra_checkout_state[opened_checkout]["count"] = 0
+                extra_checkout_state[opened_checkout]["trend"] = 1
+                latest_metrics[f"queue{opened_checkout}"] = 0
+            latest_metrics["last_action"] = f"open_register({lane_id})"
+            latest_metrics["last_action_time"] = time.time()
+        
+        log_event(f"Checkout opened (lane {lane_id}) — Total: {latest_metrics['checkouts_open']}")
+        
+        return jsonify({
+            "ok": True,
+            "checkouts_open": latest_metrics["checkouts_open"],
+            "message": f"Checkout {latest_metrics['checkouts_open']} opened"
+        })
+
+    @app.route("/remove_checkout", methods=["POST"])
+    def remove_checkout():
+        """Close a checkout (tool call from agent)."""
+        data = request.get_json(silent=True) or {}
+        lane_id = data.get("lane_id")
+        
+        with metrics_lock:
+            # Ensure we don't go below 2 (the base checkouts)
+            min_checkouts = 2
+            if latest_metrics["checkouts_open"] <= min_checkouts:
+                return jsonify({
+                    "error": f"Minimum {min_checkouts} checkouts must stay open",
+                    "checkouts_open": latest_metrics["checkouts_open"]
+                }), 409
+            
+            # Remove checkout
+            latest_metrics["checkouts_open"] -= 1
+            for checkout_num in (3, 4):
+                if latest_metrics["checkouts_open"] < checkout_num:
+                    extra_checkout_state[checkout_num]["count"] = 0
+                    extra_checkout_state[checkout_num]["trend"] = 1
+                    latest_metrics[f"queue{checkout_num}"] = 0
+            latest_metrics["last_action"] = f"close_register({lane_id})"
+            latest_metrics["last_action_time"] = time.time()
+        
+        log_event(f"Checkout closed (lane {lane_id}) — Total: {latest_metrics['checkouts_open']}")
+        
+        return jsonify({
+            "ok": True,
+            "checkouts_open": latest_metrics["checkouts_open"],
+            "message": f"Checkout closed — Total: {latest_metrics['checkouts_open']}"
+        })
 
     return app
 
@@ -436,7 +694,10 @@ def main():
     if not args.no_agent:
         agent_thread = threading.Thread(target=agent_worker, args=(det_state.stop_event,), daemon=True)
         agent_thread.start()
-        print("[INFO] Agent worker started (interval: 5s)")
+        print("[INFO] Agent worker started")
+        report_thread = threading.Thread(target=report_worker, args=(det_state.stop_event,), daemon=True)
+        report_thread.start()
+        print("[INFO] Report worker started (every 60s)")
     else:
         print("[INFO] Agent disabled (--no-agent)")
 

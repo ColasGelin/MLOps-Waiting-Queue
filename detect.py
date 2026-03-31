@@ -160,23 +160,28 @@ class TrackRegistry:
 
 # ── store counter ────────────────────────────────────────────────────────────
 class StoreCounter:
-    """Simulates total store occupancy based on detected people in view."""
+    """Simulates total store occupancy based on detected people in view.
+    Steps by at most ±1 every 3 seconds toward a target, keeping the
+    displayed value stable and realistic (target range 20-30)."""
 
-    def __init__(self, baseline: int = 15):
-        self._baseline = baseline
-        self._drift = 0.0
-        self._last_time = time.time()
+    def __init__(self):
+        self._current = 22          # start mid-range
+        self._last_step = time.time()
+        self.STEP_INTERVAL = 3.0    # seconds between ±1 steps
 
     def update(self, detected_count: int) -> int:
-        """Return estimated total store count. Drifts slowly, multiplies
-        the checkout-area count by 3.5-5x to simulate unseen areas."""
+        # Target: detected people in checkout × 2 + small base, clamped 20-30
+        target = max(20, min(40, detected_count * 1.2 + 12))
+
         now = time.time()
-        dt = now - self._last_time
-        self._last_time = now
-        self._drift += random.gauss(0, 0.3) * dt
-        self._drift = max(-5.0, min(5.0, self._drift))
-        multiplier = 3.5 + random.random() * 1.5
-        return max(0, int(detected_count * multiplier + self._baseline + self._drift))
+        if now - self._last_step >= self.STEP_INTERVAL:
+            if self._current < target:
+                self._current += 1
+            elif self._current > target:
+                self._current -= 1
+            self._last_step = now
+
+        return self._current
 
 
 # ── trend helper ─────────────────────────────────────────────────────────────
@@ -511,10 +516,6 @@ def run(video_path: str, output_path: str, preview: bool = True,
                 "clients_visible": len(visible),
                 "store_count": store_count,
             })
-
-        # ── draw zones ────────────────────────────────────────────────────────
-        draw_zone(frame, zone1, ZONE_COLORS[0], "Queue 1")
-        draw_zone(frame, zone2, ZONE_COLORS[1], "Queue 2")
 
         # ── draw client tracks ────────────────────────────────────────────────
         for (x1, y1, x2, y2), cid in visible:
