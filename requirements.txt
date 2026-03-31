@@ -1,2 +1,14 @@
-ultralytics>=8.0.0
-opencv-python>=4.8.0
+# ── computer vision ───────────────────────────────────────────────────────────
+ultralytics==8.4.32
+opencv-python==4.13.0.92
+ 
+# ── web server ────────────────────────────────────────────────────────────────
+flask==3.1.3
+requests==2.33.1
+ 
+# ── llm / agent ───────────────────────────────────────────────────────────────
+langchain==1.2.13
+langchain-core==1.2.23
+langchain-ollama==1.0.1
+langgraph==1.1.3
+ 

@@ -1,6 +1,0 @@
-path: /home/colas/Projects/Supermlarket/dataset_prepared/
-train: train/images
-val: val/images
-
-nc: 2
-names: ['Client', 'Employee']

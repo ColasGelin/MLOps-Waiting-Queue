@@ -4,8 +4,8 @@ import random
 from pathlib import Path
 
 # Config
-SOURCE = Path("dataset_empty")
-OUTPUT = Path("dataset")
+SOURCE = Path("datasettopview")
+OUTPUT = Path("datasettopview")
 TRAIN_RATIO = 0.8
 SEED = 42
 
@@ -44,7 +44,8 @@ for stem in val_stems:
     copy_pair(stem, "val")
 
 # Copy classes.txt
-shutil.copy2(SOURCE / "classes.txt", OUTPUT / "classes.txt")
+if SOURCE != OUTPUT:
+    shutil.copy2(SOURCE / "classes.txt", OUTPUT / "classes.txt")
 
 # Write data.yaml
 classes = [l.strip() for l in (SOURCE / "classes.txt").read_text().splitlines() if l.strip()]

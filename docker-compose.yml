@@ -1,0 +1,60 @@
+# ── Queue Monitor — Docker Compose (CPU) ─────────────────────────────────────
+#
+# Usage:
+#   docker compose up --build
+#
+# Configure via a .env file or shell environment:
+#   VIDEO_FILE=/data/testclip.mp4
+#   ZONE1=100,50,500,50,500,400,100,400
+#   ZONE2=520,50,920,50,920,400,520,400
+#   YOLO_DEVICE=cpu          (use "0" for GPU, see docker-compose.gpu.yml)
+#   NO_AGENT=false           (set "true" to skip LLM entirely)
+#   OLLAMA_MODEL=llama3.1    (any model available on hub.ollama.ai)
+#
+# The project directory is mounted at /data inside the app container,
+# so --video /data/yourfile.mp4 works for any .mp4 in this folder.
+
+services:
+
+  # ── Ollama LLM server ──────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: qm-ollama
+    volumes:
+      - ollama_data:/root/.ollama   # model weights persist across restarts
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Python app (detector + Flask + agent) ─────────────────────────────────
+  app:
+    build: .
+    container_name: qm-app
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/data:ro              # mount project dir so video files are accessible
+    environment:
+      OLLAMA_HOST:  http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
+      VIDEO_FILE:   ${VIDEO_FILE:-/data/testclip.mp4}
+      YOLO_MODEL:   ${YOLO_MODEL:-yolov8s.pt}
+      CONF_THRESH:  ${CONF_THRESH:-0.35}
+      YOLO_DEVICE:  ${YOLO_DEVICE:-cpu}
+      ZONE1:        ${ZONE1:-}
+      ZONE2:        ${ZONE2:-}
+      NO_AGENT:     ${NO_AGENT:-true}
+      PORT:         8000
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ollama_data:

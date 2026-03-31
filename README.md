@@ -87,3 +87,44 @@ ffmpeg -i input.mov -c:v libx264 output.mp4
 - Step 3: Queue zone detection + wait time estimation
 - Step 4: LangGraph agent layer
 - Step 5: Grafana monitoring dashboard
+
+---
+
+## Web Livestream UI
+
+This project now includes a full browser UI that makes your video behave like a live stream:
+
+- Live detection video stream in the browser
+- Real-time dashboard for all black-box values:
+  - Video FPS
+  - Processing FPS
+  - Employee count
+  - Queue 1 and Queue 2 counts
+  - Queue 1 and Queue 2 average wait times
+  - Clients visible, frame progress, uptime, loop count
+
+### Run the web app
+
+```bash
+python webapp.py --video topclip1.mp4 --zone1 400,400,1100,800,1000,1000,200,600 --zone2 900,200,1300,200,1200,500,700,300
+```
+
+Then open:
+
+```text
+http://localhost:8000
+```
+
+### Useful options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--video` | required | Source video file |
+| `--model` | yolov8s.pt | YOLO model |
+| `--conf` | 0.35 | Confidence threshold |
+| `--device` | cpu | Inference device (`cpu`, `0`, etc.) |
+| `--zone1` / `--zone2` | none | Queue polygons: `x1,y1,x2,y2,x3,y3,x4,y4` |
+| `--host` | 0.0.0.0 | Web host |
+| `--port` | 8000 | Web port |
+| `--no-loop` | false | Stop stream when video ends |
+

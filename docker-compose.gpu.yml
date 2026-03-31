@@ -1,0 +1,31 @@
+# ── GPU override ──────────────────────────────────────────────────────────────
+# Extends docker-compose.yml with NVIDIA GPU support for both Ollama and YOLO.
+#
+# Requirements:
+#   - NVIDIA drivers installed on host
+#   - nvidia-container-toolkit installed (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+
+services:
+
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  app:
+    environment:
+      YOLO_DEVICE: "0"    # use first CUDA GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

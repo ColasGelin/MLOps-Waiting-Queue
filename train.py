@@ -9,7 +9,7 @@ Usage:
 import argparse
 from ultralytics import YOLO
 
-DATA_YAML  = "dataset_prepared/data.yaml"
+DATA_YAML  = "datasettopview/data.yaml"
 BASE_MODEL = "yolov8s.pt"
 EPOCHS     = 100
 BATCH      = 8
@@ -46,17 +46,17 @@ def train(model_path: str, epochs: int, batch: int):
         hsv_v=0.4,
 
         # ── output ───────────────────────────────────────────────────────────
-        project="runs/detect",
+        project="runs",
         name="supermarket_finetune",
         exist_ok=True,
         save=True,
-        plots=True,
+        plots=False,
 
         # ── early stopping ───────────────────────────────────────────────────
         patience=30,
 
         device=0,       # GPU 0; change to "cpu" if no GPU
-        workers=4,
+        workers=0,
         verbose=True,
     )
 

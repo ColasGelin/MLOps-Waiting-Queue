@@ -1,7 +1,7 @@
 task: detect
 mode: train
 model: yolov8s.pt
-data: dataset_prepared/data.yaml
+data: datasettopview/data.yaml
 epochs: 100
 time: null
 patience: 30
@@ -11,7 +11,7 @@ save: true
 save_period: -1
 cache: false
 device: '0'
-workers: 4
+workers: 0
 project: runs/detect
 name: supermarket_finetune
 exist_ok: true

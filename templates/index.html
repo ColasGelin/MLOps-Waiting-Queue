@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Queue Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <!-- ── Header ──────────────────────────────────────────── -->
+  <header class="header">
+    <div class="header-left">
+      <span class="pulse-dot"></span>
+      <span class="header-title">QUEUE MONITOR</span>
+    </div>
+    <div class="header-right">
+      <span class="header-clock" id="clock">00:00:00</span>
+    </div>
+  </header>
+
+  <!-- ── Main layout ─────────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Left: Video + metrics bar -->
+    <section class="video-section">
+      <div class="video-container">
+        <img id="video-feed" src="/video" alt="Live feed" />
+        <!-- High-urgency popup overlay -->
+        <div id="popup" class="popup popup-hidden"></div>
+      </div>
+      <div class="metrics-bar">
+        <div class="metric-item">
+          <span class="metric-label">Lane 1</span>
+          <span class="metric-value" id="m-lane1">0</span>
+        </div>
+        <div class="metric-sep"></div>
+        <div class="metric-item">
+          <span class="metric-label">Lane 2</span>
+          <span class="metric-value" id="m-lane2">0</span>
+        </div>
+        <div class="metric-sep"></div>
+        <div class="metric-item">
+          <span class="metric-label">In Store</span>
+          <span class="metric-value" id="m-store">0</span>
+        </div>
+        <div class="metric-sep"></div>
+        <div class="metric-item status-item">
+          <span class="status-dot" id="status-dot"></span>
+          <span class="metric-value" id="m-status">MONITORING</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Right: Agent decisions panel -->
+    <aside class="events-panel">
+      <div class="events-header">
+        <h2>Agent Decisions</h2>
+        <span class="event-count" id="event-count">0 events</span>
+      </div>
+      <div class="cards-container" id="cards"></div>
+    </aside>
+
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
