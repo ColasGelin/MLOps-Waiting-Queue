@@ -8,6 +8,7 @@ const pendingCvCards = new Map();
 // ── Checkout state ────────────────────────────────────────────────────────
 let checkoutCount = 2; // Base: checkout 1 & 2 always present
 let extraCounts = { 3: 0, 4: 0 };
+let prevCounts = { 1: -1, 2: -1, 3: -1, 4: -1 };
 
 // ── DOM refs ────────────────────────────────────────────────────────────
 const $clock      = document.getElementById("clock");
@@ -30,22 +31,51 @@ function updateClock() {
 updateClock();
 setInterval(updateClock, 1000);
 
-// ── Render extra checkouts (3+) ─────────────────────────────────────────
+// ── Render extra checkouts (3+) — in-place update, animate on change ────
 function renderExtraCheckouts() {
-  let html = "";
-  for (let i = 3; i <= checkoutCount; i++) {
-    const count = i === 3 ? (extraCounts[3] ?? 0) : (extraCounts[4] ?? 0);
+  for (let i = 3; i <= 4; i++) {
+    const count = extraCounts[i] ?? 0;
+    const existing = document.getElementById(`checkout-${i}`);
 
-    html += `
-      <div class="metric-sep"></div>
-      <div class="mblock" id="checkout-${i}">
+    if (i > checkoutCount) {
+      // Lane closed — remove block and its leading separator if present
+      if (existing) {
+        const sep = existing.previousElementSibling;
+        if (sep && sep.classList.contains("metric-sep")) sep.remove();
+        existing.remove();
+      }
+      prevCounts[i] = -1;
+      continue;
+    }
+
+    if (!existing) {
+      // Lane newly opened — create separator + block (slideInCheckout fires via CSS)
+      const sep = document.createElement("div");
+      sep.className = "metric-sep";
+      $extraCheckouts.appendChild(sep);
+
+      const block = document.createElement("div");
+      block.className = "mblock";
+      block.id = `checkout-${i}`;
+      block.innerHTML = `
         <div class="mblock-label">Checkout ${i}</div>
-        <div class="mblock-main">${count} <span class="mblock-unit">waiting</span></div>
+        <div class="mblock-main" id="m-lane${i}">${count} <span class="mblock-unit">waiting</span></div>
         <div class="mblock-sub">active</div>
-      </div>
-    `;
+      `;
+      $extraCheckouts.appendChild(block);
+      prevCounts[i] = count;
+      continue;
+    }
+
+    // Lane already in DOM — update count in place, animate only if changed
+    if (count !== prevCounts[i]) {
+      const mainEl = document.getElementById(`m-lane${i}`);
+      if (mainEl) {
+        mainEl.innerHTML = `${count} <span class="mblock-unit">waiting</span>`;
+      }
+      prevCounts[i] = count;
+    }
   }
-  $extraCheckouts.innerHTML = html;
 }
 
 // ── Metrics polling ─────────────────────────────────────────────────────
@@ -69,9 +99,17 @@ async function pollMetrics() {
     }
     renderExtraCheckouts();
     
-    // Update real queues
-    $lane1.innerHTML  = `${m.queue1 ?? 0} <span class="mblock-unit">waiting</span>`;
-    $lane2.innerHTML  = `${m.queue2 ?? 0} <span class="mblock-unit">waiting</span>`;
+    // Update real queues — animate the parent mblock when count changes
+    const q1 = m.queue1 ?? 0;
+    const q2 = m.queue2 ?? 0;
+    if (q1 !== prevCounts[1]) {
+      $lane1.innerHTML = `${q1} <span class="mblock-unit">waiting</span>`;
+      prevCounts[1] = q1;
+    }
+    if (q2 !== prevCounts[2]) {
+      $lane2.innerHTML = `${q2} <span class="mblock-unit">waiting</span>`;
+      prevCounts[2] = q2;
+    }
     
     // Update wait times
     const lane1Sub = document.getElementById("m-lane1-sub");
@@ -236,7 +274,7 @@ function buildDecisionBody(label, badgeClass, data, alertMessage) {
       <span class="event-badge ${badgeClass}">${label}</span>
     </div>
     ${alertMessage ? `
-    <div class="card-field">
+    <div class="card-field card-field-alert">
       <div class="card-field-label">Alert</div>
       <div class="card-field-value">${esc(alertMessage)}</div>
     </div>` : ""}
@@ -247,7 +285,12 @@ function buildDecisionBody(label, badgeClass, data, alertMessage) {
         <span class="param-chip">Q2 ${num(metrics.queue2)}</span>
         <span class="param-chip">Q3 ${num(metrics.queue3)}</span>
         <span class="param-chip">Q4 ${num(metrics.queue4)}</span>
-        <span class="param-chip">Open ${num(metrics.checkouts_open)}</span>
+        <span class="param-chip param-chip-sep">|</span>
+        <span class="param-chip">Avg Q1 ${metrics.queue1_avg_wait != null ? metrics.queue1_avg_wait.toFixed(1) + "s" : "—"}</span>
+        <span class="param-chip">Avg Q2 ${metrics.queue2_avg_wait != null ? metrics.queue2_avg_wait.toFixed(1) + "s" : "—"}</span>
+        <span class="param-chip param-chip-sep">|</span>
+        <span class="param-chip">Client in Store ${num(metrics.store_count)}</span>
+        <span class="param-chip">Open Checkouts ${num(metrics.checkouts_open)}</span>
       </div>
     </div>
     <div class="card-field">

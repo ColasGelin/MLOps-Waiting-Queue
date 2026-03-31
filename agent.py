@@ -24,6 +24,12 @@ FLASK_BASE_URL = os.environ.get("FLASK_BASE_URL", "http://localhost:8000")
 def open_register(lane_id: int) -> str:
     """Open a checkout register for the specified lane."""
     try:
+        # Hard guard: check current state before attempting to open
+        metrics_resp = requests.get(f"{FLASK_BASE_URL}/metrics", timeout=5)
+        if metrics_resp.status_code == 200:
+            current_open = metrics_resp.json().get("checkouts_open", 0)
+            if current_open >= 4:
+                return f"Cannot open register: already at maximum 4 checkouts open."
         response = requests.post(
             f"{FLASK_BASE_URL}/add_checkout",
             json={"lane_id": lane_id},
@@ -105,7 +111,7 @@ RULES:
 - Keep responses concise — one sentence per field.
 - If last_action_taken shows a register was opened recently, assume the queue is
   already being addressed and avoid opening another one. Queues take time to drain.
-- NEVER exceed 4 open checkouts total. Check the checkouts_open field first.
+- NEVER call open_register if can_open_more is false or checkouts_open is already 4. This is a hard limit.
 - Close registers if queues are empty and they're underutilized.
 
 Respond in EXACTLY this format (no extra text):
@@ -138,19 +144,25 @@ def analyze_node(state: AgentState) -> dict:
         elapsed = int(time.time() - last_action_time)
         last_action_str = f'"{last_action} ({elapsed}s ago)"'
 
+    checkouts_open = m.get("checkouts_open", 2)
     human_msg = (
         f"Current queue metrics (JSON snapshot):\n"
         f"{{\n"
+        f'  "checkout_1_open": {str(checkouts_open >= 1).lower()},\n'
         f'  "lane_1_people": {m.get("queue1", 0)},\n'
         f'  "lane_1_trend": "{m.get("queue1_trend", "stable")}",\n'
         f'  "lane_1_avg_wait_sec": {m.get("queue1_avg_wait") or "null"},\n'
+        f'  "checkout_2_open": {str(checkouts_open >= 2).lower()},\n'
         f'  "lane_2_people": {m.get("queue2", 0)},\n'
         f'  "lane_2_trend": "{m.get("queue2_trend", "stable")}",\n'
         f'  "lane_2_avg_wait_sec": {m.get("queue2_avg_wait") or "null"},\n'
+        f'  "checkout_3_open": {str(checkouts_open >= 3).lower()},\n'
         f'  "checkout_3_people": {m.get("queue3", 0)},\n'
+        f'  "checkout_4_open": {str(checkouts_open >= 4).lower()},\n'
         f'  "checkout_4_people": {m.get("queue4", 0)},\n'
+        f'  "checkouts_open": {checkouts_open},\n'
+        f'  "can_open_more": {str(checkouts_open < 4).lower()},\n'
         f'  "customers_in_store": {m.get("store_count", 0)},\n'
-        f'  "checkouts_open": {m.get("checkouts_open", 2)},\n'
         f'  "employees_visible": {m.get("employees", 0)},\n'
         f'  "last_action_taken": {last_action_str}\n'
         f"}}"

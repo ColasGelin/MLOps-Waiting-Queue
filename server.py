@@ -99,19 +99,15 @@ latest_metrics = {
 metrics_lock = threading.Lock()
 
 # Simulated activity state for dynamic checkouts (3 and 4), backend-owned.
+# Each checkout has its own next_update timestamp for irregular timing.
 extra_checkout_state = {
-    3: {"count": 0, "trend": 1},
-    4: {"count": 0, "trend": 1},
+    3: {"count": 0, "trend": 1, "next_update": 0.0},
+    4: {"count": 0, "trend": 1, "next_update": 0.0},
 }
-extra_checkout_last_update = 0.0
 
 
 def _update_extra_checkouts_locked(now_ts: float):
-    """Update queue3/queue4 every 5s; only open checkouts fluctuate, closed reset to 0."""
-    global extra_checkout_last_update
-    if now_ts - extra_checkout_last_update < 5.0:
-        return
-
+    """Update queue3/queue4 on independent irregular intervals (1.5–9s each)."""
     open_count = int(latest_metrics.get("checkouts_open", 2))
     for checkout_num in (3, 4):
         state = extra_checkout_state[checkout_num]
@@ -121,17 +117,21 @@ def _update_extra_checkouts_locked(now_ts: float):
         if not is_open:
             state["count"] = 0
             state["trend"] = 1
+            state["next_update"] = 0.0
             latest_metrics[key] = 0
             continue
+
+        if now_ts < state["next_update"]:
+            continue
+
+        # Each checkout picks its own next update time independently
+        state["next_update"] = now_ts + random.uniform(1.5, 9.0)
 
         if random.random() < 0.6:
             state["trend"] = 1 if random.random() < 0.5 else -1
 
         state["count"] += state["trend"]
-        if state["count"] < 0:
-            state["count"] = 0
-        if state["count"] > 5:
-            state["count"] = 5
+        state["count"] = max(0, min(5, state["count"]))
 
         if state["count"] == 0:
             state["trend"] = 1
@@ -139,8 +139,6 @@ def _update_extra_checkouts_locked(now_ts: float):
             state["trend"] = -1
 
         latest_metrics[key] = int(state["count"])
-
-    extra_checkout_last_update = now_ts
 
 
 def broadcast_event(event_data: dict):

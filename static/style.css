@@ -192,21 +192,18 @@ html, body {
 
 /* Subtle highlight for extra checkout blocks (added dynamically) */
 #extra-checkouts .mblock {
-  animation: slideInCheckout 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
-  background: rgba(59, 130, 246, 0.04);
   border-radius: 6px;
   padding: 8px 24px;
 }
 
-@keyframes slideInCheckout {
-  from {
-    opacity: 0;
-    transform: translateX(-15px);
-  }
-  to {
-    opacity: 1;
-    transform: translateX(0);
-  }
+/* Fired on all 4 checkout blocks when their count changes */
+.mblock-count-update {
+  animation: countUpdate 0.38s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes countUpdate {
+  0%   { opacity: 0.4; transform: translateX(-10px); }
+  100% { opacity: 1;   transform: translateX(0); }
 }
 
 .mblock-status {
@@ -364,6 +361,23 @@ html, body {
   color: var(--text-dim);
 }
 
+/* CV alert row — highlights the detection source vs LLM reasoning */
+.card-field-alert {
+  background: rgba(239, 68, 68, 0.07);
+  border: 1px solid rgba(239, 68, 68, 0.22);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  margin-bottom: 10px;
+}
+
+.card-field-alert .card-field-label {
+  color: #fca5a5;
+}
+
+.card-field-alert .card-field-value {
+  color: var(--text);
+}
+
 .card-field-value strong {
   color: var(--text);
   font-weight: 600;
@@ -418,6 +432,12 @@ html, body {
   background: rgba(148, 163, 184, 0.12);
   color: var(--text-dim);
   letter-spacing: 0.03em;
+}
+
+.param-chip-sep {
+  background: none;
+  color: var(--text-faint);
+  padding: 2px 2px;
 }
 
 /* ── Decision card — new compact layout ────────────────────────────────── */

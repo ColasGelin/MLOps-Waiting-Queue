@@ -161,24 +161,34 @@ class TrackRegistry:
 # ── store counter ────────────────────────────────────────────────────────────
 class StoreCounter:
     """Simulates total store occupancy based on detected people in view.
-    Steps by at most ±1 every 3 seconds toward a target, keeping the
-    displayed value stable and realistic (target range 20-30)."""
+    Steps toward a drifting target every 1.5s, allowing ±1 or ±2 steps
+    for more dynamic swings across the 12–30 range."""
 
     def __init__(self):
-        self._current = 22          # start mid-range
+        self._current = 18
+        self._target  = 18
         self._last_step = time.time()
-        self.STEP_INTERVAL = 3.0    # seconds between ±1 steps
+        self._last_retarget = time.time()
+        self.STEP_INTERVAL     = 1.5   # seconds between steps
+        self.RETARGET_INTERVAL = 8.0   # seconds between picking a new target
 
     def update(self, detected_count: int) -> int:
-        # Target: detected people in checkout × 2 + small base, clamped 20-30
-        target = max(20, min(40, detected_count * 1.2 + 12))
-
+        import random as _r
         now = time.time()
+
+        # Periodically pick a new target in 12–30, biased by detected count
+        if now - self._last_retarget >= self.RETARGET_INTERVAL:
+            base = max(12, min(28, int(detected_count * 1.5 + 8)))
+            self._target = base + _r.randint(-4, 4)
+            self._target = max(12, min(30, self._target))
+            self._last_retarget = now
+
         if now - self._last_step >= self.STEP_INTERVAL:
-            if self._current < target:
-                self._current += 1
-            elif self._current > target:
-                self._current -= 1
+            diff = self._target - self._current
+            if diff != 0:
+                # Step by 1 normally, occasionally 2 for bigger swings
+                step = min(abs(diff), 2 if _r.random() < 0.3 else 1)
+                self._current += step if diff > 0 else -step
             self._last_step = now
 
         return self._current
@@ -538,39 +548,7 @@ def run(video_path: str, output_path: str, preview: bool = True,
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 draw_box(frame, x1, y1, x2, y2, color=EMPLOYEE_COLOR, label="Employee")
 
-        # ── HUD ───────────────────────────────────────────────────────────────
-        queue_counts = []
-        avg_waits    = []
-        if zone1 is not None:
-            queue_counts.append(("Queue 1", q1_count))
-            all_w = zone_completed_waits[0] + [
-                (frame_idx - zone_entry_frame[0].get(cid, frame_idx)) / video_fps
-                for cid, f in zone_dwell[0].items() if f >= min_frames
-            ]
-            avg_waits.append(sum(all_w) / len(all_w) if all_w else None)
-        if zone2 is not None:
-            queue_counts.append(("Queue 2", q2_count))
-            all_w = zone_completed_waits[1] + [
-                (frame_idx - zone_entry_frame[1].get(cid, frame_idx)) / video_fps
-                for cid, f in zone_dwell[1].items() if f >= min_frames
-            ]
-            avg_waits.append(sum(all_w) / len(all_w) if all_w else None)
-        if not queue_counts:
-            queue_counts.append(("Clients", len(visible)))
-        draw_hud(frame, employee_count, video_fps, queue_counts, avg_waits)
-
-        out.write(frame)
-
-        if preview_enabled:
-            cv2.imshow("Queue Detector", frame)
-            if cv2.waitKey(delay_ms) & 0xFF == ord("q"):
-                print("[INFO] Stopped by user.")
-                break
-
-        if frame_idx % 30 == 0:
-            elapsed = time.time() - t_start
-            print(f"[{elapsed:.1f}]s Frames:{frame_idx}/{total_frames} "
-                  f"| Q1:{q1_count} Q2:{q2_count} Employees:{employee_count}")
+        
 
     cap.release()
     out.release()
