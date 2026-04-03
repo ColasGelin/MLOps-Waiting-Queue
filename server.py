@@ -54,6 +54,8 @@ CLOSE_TOTAL_MAX      = 8     # total people across all lanes must be ≤ this
 CLOSE_DURATION       = 10.0  # seconds the condition must hold before alert fires
 CLOSE_COOLDOWN       = 40.0  # seconds between close-checkout alerts
 
+GLOBAL_ALERT_MIN_GAP = 5.0   # minimum seconds between any two broadcast alerts
+
 # ── Shared state ─────────────────────────────────────────────────────────────
 
 # Thread-safe queue for SSE events (agent decisions)
@@ -163,8 +165,8 @@ def broadcast_event(event_data: dict):
 # ── Detector worker ─────────────────────────────────────────────────────────
 
 class DetectorState:
-    def __init__(self, video_path, model_name, conf, zone1, zone2, device, loop_video):
-        self.video_path = video_path
+    def __init__(self, video_paths, model_name, conf, zone1, zone2, device, loop_video):
+        self.video_paths = video_paths if isinstance(video_paths, list) else [video_paths]
         self.model_name = model_name
         self.conf = conf
         self.zone1 = zone1
@@ -181,8 +183,24 @@ def detector_worker(state: DetectorState):
     """Run YOLO + ByteTrack on the video, produce JPEG frames and metrics."""
     try:
         model = YOLO(state.model_name)
+        store_counter = StoreCounter()
+        frame_idx = 0
+        proc_t0 = time.time()
+
+        # Alert/report state — persists across clips
+        frame_ms_history: list = []
+        lane_alert = [{"high_since": None}, {"high_since": None}]
+        last_global_alert = 0.0
+        last_any_alert = 0.0
+        alert_counter = 0
+        close_alert_lane: dict[int, float] = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+        last_close_alert = 0.0
+
+        clip_index = 0
+
+        # Open first clip
         tracker = BYTETracker(TRACKER_ARGS, frame_rate=30)
-        cap = cv2.VideoCapture(state.video_path)
+        cap = cv2.VideoCapture(state.video_paths[clip_index])
         if not cap.isOpened():
             with metrics_lock:
                 latest_metrics["status"] = "error"
@@ -191,28 +209,11 @@ def detector_worker(state: DetectorState):
         video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         registry = TrackRegistry(video_fps)
-        store_counter = StoreCounter()
-        frame_idx = 0
-        proc_t0 = time.time()
         zone_dwell = [{}, {}]
         zone_entry_frame = [{}, {}]
         zone_completed_waits = [[], []]
-
-        # History for trend computation
         q1_history = []
         q2_history = []
-
-        # Rolling average for frame processing time (last 30 frames)
-        frame_ms_history = []
-
-        # Alert state: high_since per lane, single global cooldown + counter
-        lane_alert = [{"high_since": None}, {"high_since": None}]
-        last_global_alert = 0.0
-        alert_counter = 0
-
-        # Close-checkout alert state — tracked per lane (0.0 = not active)
-        close_alert_lane: dict[int, float] = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
-        last_close_alert = 0.0
 
         with metrics_lock:
             latest_metrics["total_frames"] = total_frames
@@ -222,10 +223,18 @@ def detector_worker(state: DetectorState):
             # ── Debug reset ──────────────────────────────────────────────────
             if state.reset_event.is_set():
                 state.reset_event.clear()
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                clip_index = 0
                 frame_idx = 0
                 proc_t0 = time.time()
+                cap.release()
                 tracker = BYTETracker(TRACKER_ARGS, frame_rate=30)
+                cap = cv2.VideoCapture(state.video_paths[clip_index])
+                if not cap.isOpened():
+                    with metrics_lock:
+                        latest_metrics["status"] = "error"
+                    return
+                video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 registry = TrackRegistry(video_fps)
                 zone_dwell = [{}, {}]
                 zone_entry_frame = [{}, {}]
@@ -235,26 +244,45 @@ def detector_worker(state: DetectorState):
                 frame_ms_history = []
                 lane_alert = [{"high_since": None}, {"high_since": None}]
                 last_global_alert = 0.0
+                last_any_alert = 0.0
                 alert_counter = 0
                 close_alert_lane = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
                 last_close_alert = 0.0
                 with metrics_lock:
+                    latest_metrics["total_frames"] = total_frames
                     latest_metrics["status"] = "running"
+                continue
 
             ret, frame = cap.read()
             if not ret:
-                if state.loop_video:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    frame_idx = 0
-                    tracker = BYTETracker(TRACKER_ARGS, frame_rate=30)
-                    registry = TrackRegistry(video_fps)
-                    zone_dwell = [{}, {}]
-                    zone_entry_frame = [{}, {}]
-                    zone_completed_waits = [[], []]
-                    continue
+                # Advance to the next clip (or loop back to the first)
+                clip_index += 1
+                if clip_index >= len(state.video_paths):
+                    if state.loop_video:
+                        clip_index = 0
+                    else:
+                        with metrics_lock:
+                            latest_metrics["status"] = "ended"
+                        break
+                cap.release()
+                tracker = BYTETracker(TRACKER_ARGS, frame_rate=30)
+                cap = cv2.VideoCapture(state.video_paths[clip_index])
+                if not cap.isOpened():
+                    with metrics_lock:
+                        latest_metrics["status"] = "error"
+                    return
+                video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                registry = TrackRegistry(video_fps)
+                zone_dwell = [{}, {}]
+                zone_entry_frame = [{}, {}]
+                zone_completed_waits = [[], []]
+                q1_history = []
+                q2_history = []
                 with metrics_lock:
-                    latest_metrics["status"] = "ended"
-                break
+                    latest_metrics["total_frames"] = total_frames
+                    latest_metrics["status"] = "running"
+                continue
 
             frame_idx += 1
             frame_start = time.time()
@@ -326,7 +354,8 @@ def detector_worker(state: DetectorState):
                     if lane_state["high_since"] is None:
                         lane_state["high_since"] = now_t
                     elif (now_t - lane_state["high_since"] >= ALERT_DURATION
-                          and now_t - last_global_alert >= ALERT_COOLDOWN):
+                          and now_t - last_global_alert >= ALERT_COOLDOWN
+                          and now_t - last_any_alert >= GLOBAL_ALERT_MIN_GAP):
                         # Skip if LLM is busy or a tool action was recently taken
                         with agent_busy_lock:
                             if agent_busy:
@@ -354,6 +383,7 @@ def detector_worker(state: DetectorState):
                         except queue.Full:
                             pass
                         last_global_alert = now_t
+                        last_any_alert = now_t
                 else:
                     lane_state["high_since"] = None
 
@@ -375,7 +405,8 @@ def detector_worker(state: DetectorState):
                 if count <= CLOSE_LANE_MAX and total_q <= CLOSE_TOTAL_MAX and cooldowns_ok:
                     if close_alert_lane[lane] == 0.0:
                         close_alert_lane[lane] = now_t
-                    elif now_t - close_alert_lane[lane] >= CLOSE_DURATION:
+                    elif (now_t - close_alert_lane[lane] >= CLOSE_DURATION
+                          and now_t - last_any_alert >= GLOBAL_ALERT_MIN_GAP):
                         with agent_busy_lock:
                             busy = agent_busy
                         if not busy:
@@ -402,6 +433,7 @@ def detector_worker(state: DetectorState):
                             except queue.Full:
                                 pass
                             close_alert_lane[lane] = 0.0
+                            last_any_alert = now_t
                 else:
                     close_alert_lane[lane] = 0.0
 
@@ -549,6 +581,10 @@ def agent_worker(stop_event: threading.Event):
             global agent_busy
             agent_busy = True
 
+        # Snapshot checkout count before any agent/tool side effects.
+        with metrics_lock:
+            checkouts_open_before = int(latest_metrics.get("checkouts_open", 2))
+
         # Deterministic shortcut: lanes with 0-1 people are always closed —
         # no LLM reasoning needed, and minimum-1 guard is enforced inline.
         if alert_type == "close" and alert_lane is not None and alert_count is not None and alert_count <= 1:
@@ -587,12 +623,11 @@ def agent_worker(stop_event: threading.Event):
                   f"Q2:{snapshot.get('queue2',0)} Store:{snapshot.get('store_count',0)}")
             result = run_agent(snapshot)
 
-        # Hard guard: veto open_register if already at max, regardless of what the LLM decided
+        # Hard guard: veto open_register only if we were already at max
+        # before the agent decision executed any tool side effects.
         if "open_register" in result.get("action", "").lower():
-            with metrics_lock:
-                current_open = latest_metrics["checkouts_open"]
-            if current_open >= 4:
-                print(f"[AGENT] Vetoed open_register — already at {current_open} checkouts")
+            if checkouts_open_before >= 4:
+                print(f"[AGENT] Vetoed open_register — already at {checkouts_open_before} checkouts")
                 result["action"] = "none"
                 result["tool_result"] = "Vetoed: already at maximum 4 checkouts."
 
@@ -703,6 +738,24 @@ def create_app(det_state: DetectorState):
 
         return Response(stream_with_context(generate()), mimetype="text/event-stream",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.route("/suggest_redirect", methods=["POST"])
+    def suggest_redirect():
+        """Broadcast a lane redirect suggestion to all connected displays."""
+        data = request.get_json(silent=True) or {}
+        from_lane = data.get("from_lane")
+        to_lane = data.get("to_lane")
+        if from_lane is None or to_lane is None:
+            return jsonify({"error": "from_lane and to_lane required"}), 400
+        broadcast_event({
+            "type": "redirect_suggestion",
+            "from_lane": from_lane,
+            "to_lane": to_lane,
+            "timestamp": time.strftime("%H:%M:%S"),
+            "message": f"Please move to checkout {to_lane} — checkout {from_lane} is currently busy.",
+        })
+        log_event(f"Redirect suggestion: lane {from_lane} \u2192 lane {to_lane}")
+        return jsonify({"ok": True})
 
     @app.route("/push_event", methods=["POST"])
     def push_event():
@@ -816,7 +869,7 @@ def create_app(det_state: DetectorState):
 
 def main():
     parser = argparse.ArgumentParser(description="Queue Monitor — Flask + YOLO + Agent")
-    parser.add_argument("--video", required=True, help="Path to video file")
+    parser.add_argument("--video", required=True, nargs="+", help="One or more video paths to play in sequence")
     parser.add_argument("--model", default="yolov8s.pt")
     parser.add_argument("--conf", type=float, default=CONF_THRESH)
     parser.add_argument("--device", default="0", help="YOLO device: cpu, 0, cuda:0")
@@ -833,7 +886,7 @@ def main():
 
     det_state = DetectorState(
         args.video, args.model, args.conf, zone1, zone2, args.device, not args.no_loop
-    )
+    )  # args.video is a list when nargs="+"
 
     # Start detector thread
     det_thread = threading.Thread(target=detector_worker, args=(det_state,), daemon=True)

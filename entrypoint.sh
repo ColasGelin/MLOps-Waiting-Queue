@@ -39,13 +39,18 @@ PORT="${PORT:-8000}"
 
 ARGS=(
     python server.py
-    --video  "$VIDEO"
     --model  "$MODEL"
     --conf   "$CONF"
     --device "$DEVICE"
     --host   "0.0.0.0"
     --port   "$PORT"
 )
+
+# Support comma-separated VIDEO_FILE for sequential clip playback
+IFS=',' read -ra _VIDEOS <<< "$VIDEO"
+for _v in "${_VIDEOS[@]}"; do
+    ARGS+=(--video "$_v")
+done
 
 [ -n "${ZONE1:-}" ] && ARGS+=(--zone1 "$ZONE1")
 [ -n "${ZONE2:-}" ] && ARGS+=(--zone2 "$ZONE2")

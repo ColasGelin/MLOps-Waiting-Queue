@@ -316,16 +316,34 @@ function startWhyTypewriter(card, data) {
   }
 }
 
-function actionLabel(action) {
+function actionLabel(action, data = {}) {
   const a = (action || "none").toLowerCase();
   if (a.includes("open_register"))  return { text: "Opening Checkout", cls: "decision-label-open" };
   if (a.includes("close_register")) return { text: "Closing Checkout", cls: "decision-label-close" };
+
+  // If the agent chose a soft intervention, present it explicitly.
+  // We match both the action string and rationale text because upstream
+  // payloads may encode redirection in either place.
+  const hint = `${data.reasoning || ""} ${data.situation || ""} ${data.tool_result || ""}`.toLowerCase();
+  const redirectPattern = /(redirect|redistribut|move\s+to\s+checkout|move\s+customers?|switch\s+lanes?)/;
+  const noActionPattern = /^(none|no\s*action|no_action|no-action)$/;
+
+  if (redirectPattern.test(a)) {
+    return { text: "Suggest Redirection", cls: "decision-label-none" };
+  }
+  if (redirectPattern.test(hint)) {
+    return { text: "Suggest Redirection", cls: "decision-label-none" };
+  }
+  if (noActionPattern.test(a)) {
+    return { text: "No Action Taken", cls: "decision-label-none" };
+  }
+
   return { text: "No Action Taken",        cls: "decision-label-none" };
 }
 
 function buildDecisionBody(label, badgeClass, data, alertMessage) {
   const metrics = data.metrics || {};
-  const { text: decisionText, cls: decisionCls } = actionLabel(data.action);
+  const { text: decisionText, cls: decisionCls } = actionLabel(data.action, data);
   return `
     <div class="card-top">
       <span class="event-badge ${badgeClass}">${label}</span>

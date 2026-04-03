@@ -80,7 +80,24 @@ def generate_shift_report() -> str:
     return "Shift report generated and queued for delivery to management."
 
 
-TOOLS = [open_register, close_register, alert_supervisor, flag_anomaly, generate_shift_report]
+@tool
+def suggest_redirect(from_lane: int, to_lane: int) -> str:
+    """Display a redirect message on the in-store screen telling clients in a busy lane to move to a shorter lane."""
+    try:
+        response = requests.post(
+            f"{FLASK_BASE_URL}/suggest_redirect",
+            json={"from_lane": from_lane, "to_lane": to_lane},
+            timeout=5
+        )
+        if response.status_code == 200:
+            return f"Redirect suggestion displayed: clients in lane {from_lane} directed to lane {to_lane}."
+        else:
+            return f"Failed to send redirect suggestion: {response.status_code}"
+    except Exception as e:
+        return f"Error sending redirect suggestion: {str(e)}"
+
+
+TOOLS = [open_register, close_register, alert_supervisor, flag_anomaly, generate_shift_report, suggest_redirect]
 TOOL_MAP = {t.name: t for t in TOOLS}
 
 
@@ -96,11 +113,13 @@ Available tools:
   alert_supervisor(message, urgency) — page the floor supervisor
   flag_anomaly(description)     — flag unusual activity for review
   generate_shift_report()       — create a shift summary
+  suggest_redirect(from_lane, to_lane) — display a screen message directing clients from a busy lane to a shorter one
 
 CURRENT STATE:
 - Lane 1 & 2: Detected by CV (real queue counts)
 - Checkout 3 & 4: Dynamically opened/closed by you (simulated queue counts)
 - checkouts_open: Total number of active checkouts (1-4 range, minimum 1)
+- You may close checkout 1 or checkout 2 when underutilised, using the same operational rules as other open lanes.
 
 DECISION PRIORITY — follow this order strictly:
 1. PEOPLE COUNT FIRST: Base every open/close decision primarily on the current number
@@ -126,10 +145,11 @@ RULES:
 - Keep responses concise — one sentence per field.
 - If last_action_taken shows a register was opened recently, assume the queue is
   already being addressed and avoid opening another one. Queues take time to drain.
-- NEVER call open_register if can_open_more is false or checkouts_open is already 4. This is a hard limit.
+- NEVER call open_register if no additional checkout capacity is available (already at 4 open checkouts).
 - NEVER call close_register if checkouts_open is already 1. This is a hard limit.
 - Close a register if its queue is 0-1 people AND the other open lanes are not overloaded (no lane above 4 people). Avg wait time is irrelevant for this decision.
 - Do NOT close a lane if doing so would leave the remaining lanes struggling (any lane at 4+ people).
+- Never mention internal field names or variable identifiers in your response.
 
 Respond in EXACTLY this format (no extra text):
 SITUATION: <one sentence>
@@ -178,7 +198,6 @@ def analyze_node(state: AgentState) -> dict:
         f'  "checkout_4_open": {str(checkouts_open >= 4).lower()},\n'
         f'  "checkout_4_people": {m.get("queue4", 0)},\n'
         f'  "checkouts_open": {checkouts_open},\n'
-        f'  "can_open_more": {str(checkouts_open < 4).lower()},\n'
         f'  "customers_in_store": {m.get("store_count", 0)},\n'
         f'  "employees_visible": {m.get("employees", 0)},\n'
         f'  "last_action_taken": {last_action_str}\n'
@@ -263,7 +282,35 @@ def parse_agent_response(text: str) -> dict:
             result["action"] = line.split(":", 1)[1].strip()
         elif upper.startswith("URGENCY:"):
             result["urgency"] = line.split(":", 1)[1].strip().lower()
+
+    result["situation"] = _sanitize_user_text(result["situation"])
+    result["reasoning"] = _sanitize_user_text(result["reasoning"])
     return result
+
+
+def _sanitize_user_text(text: str) -> str:
+    """Remove internal variable names from user-facing model text."""
+    if not text:
+        return text
+
+    replacements = {
+        "can_open_more": "more checkout capacity",
+        "checkouts_open": "open checkout count",
+        "last_action_taken": "recent action",
+        "customers_in_store": "customers in store",
+        "employees_visible": "employees visible",
+        "lane_1_people": "lane 1 queue",
+        "lane_2_people": "lane 2 queue",
+        "lane_1_avg_wait_sec": "lane 1 average wait",
+        "lane_2_avg_wait_sec": "lane 2 average wait",
+        "lane_1_trend": "lane 1 trend",
+        "lane_2_trend": "lane 2 trend",
+    }
+
+    cleaned = text
+    for token, friendly in replacements.items():
+        cleaned = re.sub(rf"\b{re.escape(token)}\b", friendly, cleaned, flags=re.IGNORECASE)
+    return cleaned
 
 
 def _execute_tool(action_str: str) -> Optional[str]:
@@ -294,6 +341,11 @@ def _execute_tool(action_str: str) -> Optional[str]:
             return tool_fn.invoke({"description": desc})
         elif name == "generate_shift_report":
             return tool_fn.invoke({})
+        elif name == "suggest_redirect":
+            parts = args_raw.split(",", 1)
+            from_lane = int(re.search(r"\d+", parts[0]).group()) if parts else 1
+            to_lane = int(re.search(r"\d+", parts[1]).group()) if len(parts) > 1 else 2
+            return tool_fn.invoke({"from_lane": from_lane, "to_lane": to_lane})
         else:
             return f"Tool {name} executed."
     except Exception as e:

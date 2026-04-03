@@ -22,11 +22,23 @@
     </div>
   </header>
 
+  <!-- ── Tab Navigation ───────────────────────────────────── -->
+  <nav class="tab-nav">
+    <button class="tab-button tab-button-active" data-tab="monitor">
+      📊 Monitor
+    </button>
+    <button class="tab-button" data-tab="dashboard">
+      📈 Dashboard
+    </button>
+  </nav>
+
   <!-- ── Main layout ─────────────────────────────────────── -->
   <main class="main">
 
-    <!-- Left: Video + metrics bar -->
-    <section class="video-section">
+    <!-- TAB 1: MONITOR ─────────────────────────────────────── -->
+    <div class="tab-pane tab-pane-active" id="monitor-tab">
+      <!-- Left: Video + metrics bar -->
+      <section class="video-section">
       <div class="video-container">
         <img id="video-feed" src="/video" alt="Live feed" />
         <!-- High-urgency popup overlay -->
@@ -96,17 +108,6 @@
             <div class="mblock-main" id="m-store">0</div>
             <div class="mblock-sub" id="m-trend">→ stable</div>
           </div>
-
-          <div class="metric-sep"></div>
-
-          <div class="mblock mblock-status">
-            <div class="mblock-label">System</div>
-            <div class="mblock-main status-row">
-              <span class="status-dot" id="status-dot"></span>
-              <span id="m-status">MONITORING</span>
-            </div>
-          </div>
-
         </div>
       </div>
     </section>
@@ -119,6 +120,30 @@
       </div>
       <div class="cards-container" id="cards"></div>
     </aside>
+
+    </div>
+
+    <!-- TAB 2: DASHBOARD ──────────────────────────────────── -->
+    <div class="tab-pane" id="dashboard-tab">
+      <div class="dashboard-placeholder">
+        <div class="dashboard-content">
+          <h2>MLOps Dashboard</h2>
+          <p>Performance metrics, model stats, and operational KPIs</p>
+          <div class="dashboard-buttons">
+            <button class="dashboard-btn" id="grafana-redirect-btn">
+              📊 Open Grafana Dashboard
+            </button>
+            <button class="dashboard-btn dashboard-btn-secondary" id="stats-refresh-btn">
+              🔄 Refresh Stats Endpoint
+            </button>
+          </div>
+          <div class="dashboard-info">
+            <p>Grafana URL: <code id="grafana-url">Not configured</code></p>
+            <p>Stats endpoint: <code>/statistics</code> (coming soon)</p>
+          </div>
+        </div>
+      </div>
+    </div>
 
   </main>
 
