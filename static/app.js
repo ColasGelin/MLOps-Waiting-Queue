@@ -107,14 +107,15 @@ async function pollMetrics() {
     // Update avg wait times for lanes 1 & 2
     const lane1Sub = document.getElementById("m-lane1-sub");
     const lane2Sub = document.getElementById("m-lane2-sub");
-    if (m.queue1_avg_wait !== null && m.queue1_avg_wait !== undefined) {
+    const isRunning = (m.status || "").toLowerCase() === "running" || (m.status || "").toLowerCase() === "monitoring" || (m.status || "").toLowerCase() === "alert";
+    if (isRunning && Number.isFinite(m.queue1_avg_wait) && m.queue1_avg_wait >= 0) {
       lane1Sub.textContent = `avg wait ${m.queue1_avg_wait.toFixed(1)}s`;
       lastQueue1Wait = m.queue1_avg_wait;
     } else {
       lane1Sub.textContent = "avg wait —";
       lastQueue1Wait = null;
     }
-    if (m.queue2_avg_wait !== null && m.queue2_avg_wait !== undefined) {
+    if (isRunning && Number.isFinite(m.queue2_avg_wait) && m.queue2_avg_wait >= 0) {
       lane2Sub.textContent = `avg wait ${m.queue2_avg_wait.toFixed(1)}s`;
       lastQueue2Wait = m.queue2_avg_wait;
     } else {
@@ -124,11 +125,11 @@ async function pollMetrics() {
 
     // Total average wait across all open lanes
     let totalWait = "—";
-    if (lastQueue1Wait !== null && lastQueue2Wait !== null) {
+    if (isRunning && lastQueue1Wait !== null && lastQueue2Wait !== null) {
       totalWait = ((lastQueue1Wait + lastQueue2Wait) / 2).toFixed(1);
-    } else if (lastQueue1Wait !== null) {
+    } else if (isRunning && lastQueue1Wait !== null) {
       totalWait = lastQueue1Wait.toFixed(1);
-    } else if (lastQueue2Wait !== null) {
+    } else if (isRunning && lastQueue2Wait !== null) {
       totalWait = lastQueue2Wait.toFixed(1);
     }
     $totalWait.innerHTML = `${totalWait} <span class="mblock-unit">seconds</span>`;
@@ -321,18 +322,19 @@ function actionLabel(action, data = {}) {
   if (a.includes("open_register"))  return { text: "Opening Checkout", cls: "decision-label-open" };
   if (a.includes("close_register")) return { text: "Closing Checkout", cls: "decision-label-close" };
 
-  // If the agent chose a soft intervention, present it explicitly.
-  // We match both the action string and rationale text because upstream
-  // payloads may encode redirection in either place.
+  // redirect_customers(from_lane, to_lane) — show "Redirect Lane X → Lane Y"
+  const redirectMatch = a.match(/redirect_customers\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/);
+  if (redirectMatch) {
+    return { text: `Redirect Lane ${redirectMatch[1]} \u2192 Lane ${redirectMatch[2]}`, cls: "decision-label-redirect" };
+  }
+
+  // Fallback: match redirection language in reasoning/situation/tool_result
   const hint = `${data.reasoning || ""} ${data.situation || ""} ${data.tool_result || ""}`.toLowerCase();
   const redirectPattern = /(redirect|redistribut|move\s+to\s+checkout|move\s+customers?|switch\s+lanes?)/;
   const noActionPattern = /^(none|no\s*action|no_action|no-action)$/;
 
-  if (redirectPattern.test(a)) {
-    return { text: "Suggest Redirection", cls: "decision-label-none" };
-  }
-  if (redirectPattern.test(hint)) {
-    return { text: "Suggest Redirection", cls: "decision-label-none" };
+  if (redirectPattern.test(a) || redirectPattern.test(hint)) {
+    return { text: "Suggest Redirection", cls: "decision-label-redirect" };
   }
   if (noActionPattern.test(a)) {
     return { text: "No Action Taken", cls: "decision-label-none" };
@@ -446,3 +448,27 @@ function esc(s) {
   d.textContent = s;
   return d.innerHTML;
 }
+
+// ── Tab Navigation ──────────────────────────────────────────────────────
+document.querySelectorAll(".tab-button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const tabName = btn.dataset.tab;
+    
+    // Dashboard tab redirects to Grafana instantly
+    if (tabName === "dashboard") {
+      const grafanaUrl = document.getElementById("grafana-url")?.textContent?.trim();
+      window.open(grafanaUrl || "http://localhost:3000/d/queue-monitor-ops", "_blank");
+      return;
+    }
+    
+    // Monitor tab switches tabs normally
+    document.querySelectorAll(".tab-button").forEach(b => b.classList.remove("tab-button-active"));
+    btn.classList.add("tab-button-active");
+    
+    document.querySelectorAll(".tab-pane").forEach(pane => pane.classList.remove("tab-pane-active"));
+    document.getElementById(`${tabName}-tab`)?.classList.add("tab-pane-active");
+  });
+});
+
+// ── Dashboard handlers ──────────────────────────────────────────────────
+// Dashboard button handlers removed - tab now redirects to Grafana directly

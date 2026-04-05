@@ -294,14 +294,14 @@ def detector_worker(state):
                     else:
                         if cid in zone_dwell[i]:
                             if zone_dwell[i][cid] >= min_frames:
-                                wait = (frame_idx - zone_entry_frame[i].get(cid, frame_idx)) / video_fps
+                                wait = max(0.0, (frame_idx - zone_entry_frame[i].get(cid, frame_idx)) / video_fps)
                                 zone_completed_waits[i].append(wait)
                             zone_dwell[i].pop(cid, None)
                             zone_entry_frame[i].pop(cid, None)
                 for cid in list(zone_dwell[i]):
                     if cid not in visible_cids:
                         if zone_dwell[i][cid] >= min_frames:
-                            wait = (frame_idx - zone_entry_frame[i].get(cid, frame_idx)) / video_fps
+                            wait = max(0.0, (frame_idx - zone_entry_frame[i].get(cid, frame_idx)) / video_fps)
                             zone_completed_waits[i].append(wait)
                         zone_dwell[i].pop(cid, None)
                         zone_entry_frame[i].pop(cid, None)
@@ -315,11 +315,11 @@ def detector_worker(state):
             for (x1, y1, x2, y2), cid in visible:
                 if zone_dwell[0].get(cid, 0) >= min_frames:
                     color = ZONE_COLORS[0]
-                    wait_s = (frame_idx - zone_entry_frame[0].get(cid, frame_idx)) / video_fps
+                    wait_s = max(0.0, (frame_idx - zone_entry_frame[0].get(cid, frame_idx)) / video_fps)
                     label = f"Client {wait_s:.0f}s"
                 elif zone_dwell[1].get(cid, 0) >= min_frames:
                     color = ZONE_COLORS[1]
-                    wait_s = (frame_idx - zone_entry_frame[1].get(cid, frame_idx)) / video_fps
+                    wait_s = max(0.0, (frame_idx - zone_entry_frame[1].get(cid, frame_idx)) / video_fps)
                     label = f"Client {wait_s:.0f}s"
                 else:
                     color = BOX_COLOR
@@ -338,7 +338,7 @@ def detector_worker(state):
             if state.zone1 is not None:
                 queue_counts.append(("Queue 1", q1_count))
                 all_w = zone_completed_waits[0] + [
-                    (frame_idx - zone_entry_frame[0].get(cid, frame_idx)) / video_fps
+                    max(0.0, (frame_idx - zone_entry_frame[0].get(cid, frame_idx)) / video_fps)
                     for cid, f in zone_dwell[0].items() if f >= min_frames
                 ]
                 q1_avg = (sum(all_w) / len(all_w)) if all_w else None
@@ -346,7 +346,7 @@ def detector_worker(state):
             if state.zone2 is not None:
                 queue_counts.append(("Queue 2", q2_count))
                 all_w = zone_completed_waits[1] + [
-                    (frame_idx - zone_entry_frame[1].get(cid, frame_idx)) / video_fps
+                    max(0.0, (frame_idx - zone_entry_frame[1].get(cid, frame_idx)) / video_fps)
                     for cid, f in zone_dwell[1].items() if f >= min_frames
                 ]
                 q2_avg = (sum(all_w) / len(all_w)) if all_w else None

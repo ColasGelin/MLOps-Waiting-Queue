@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import json
+import os
 import queue
 import random
 import threading
@@ -100,6 +101,7 @@ latest_metrics = {
     "last_action_time": 0.0,   # unix timestamp of last tool action
     "status": "initializing",
     "fps": 0.0,
+    "frame_processing_ms": 0.0,
     "frame": 0,
     "total_frames": 0,
 }
@@ -192,6 +194,7 @@ def detector_worker(state: DetectorState):
         lane_alert = [{"high_since": None}, {"high_since": None}]
         last_global_alert = 0.0
         last_any_alert = 0.0
+        last_telemetry_log_ts = 0.0
         alert_counter = 0
         close_alert_lane: dict[int, float] = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
         last_close_alert = 0.0
@@ -208,6 +211,7 @@ def detector_worker(state: DetectorState):
 
         video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        current_clip_name = os.path.basename(state.video_paths[clip_index])
         registry = TrackRegistry(video_fps)
         zone_dwell = [{}, {}]
         zone_entry_frame = [{}, {}]
@@ -218,6 +222,10 @@ def detector_worker(state: DetectorState):
         with metrics_lock:
             latest_metrics["total_frames"] = total_frames
             latest_metrics["status"] = "running"
+            latest_metrics["current_clip_index"] = clip_index + 1
+            latest_metrics["current_clip_total"] = len(state.video_paths)
+            latest_metrics["current_clip_name"] = current_clip_name
+        log_event(f"Playing clip {clip_index + 1}/{len(state.video_paths)}: {current_clip_name}")
 
         while not state.stop_event.is_set():
             # ── Debug reset ──────────────────────────────────────────────────
@@ -245,6 +253,7 @@ def detector_worker(state: DetectorState):
                 lane_alert = [{"high_since": None}, {"high_since": None}]
                 last_global_alert = 0.0
                 last_any_alert = 0.0
+                last_telemetry_log_ts = 0.0
                 alert_counter = 0
                 close_alert_lane = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
                 last_close_alert = 0.0
@@ -273,15 +282,27 @@ def detector_worker(state: DetectorState):
                     return
                 video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                current_clip_name = os.path.basename(state.video_paths[clip_index])
+                frame_idx = 0
+                proc_t0 = time.time()
                 registry = TrackRegistry(video_fps)
                 zone_dwell = [{}, {}]
                 zone_entry_frame = [{}, {}]
                 zone_completed_waits = [[], []]
                 q1_history = []
                 q2_history = []
+                frame_ms_history = []
+                lane_alert = [{"high_since": None}, {"high_since": None}]
+                last_global_alert = 0.0
+                last_any_alert = 0.0
+                last_telemetry_log_ts = 0.0
                 with metrics_lock:
                     latest_metrics["total_frames"] = total_frames
                     latest_metrics["status"] = "running"
+                    latest_metrics["current_clip_index"] = clip_index + 1
+                    latest_metrics["current_clip_total"] = len(state.video_paths)
+                    latest_metrics["current_clip_name"] = current_clip_name
+                log_event(f"Playing clip {clip_index + 1}/{len(state.video_paths)}: {current_clip_name}")
                 continue
 
             frame_idx += 1
@@ -330,14 +351,14 @@ def detector_worker(state: DetectorState):
                     else:
                         if cid in zone_dwell[i]:
                             if zone_dwell[i][cid] >= min_frames:
-                                wait = (frame_idx - zone_entry_frame[i].get(cid, frame_idx)) / video_fps
+                                wait = max(0.0, (frame_idx - zone_entry_frame[i].get(cid, frame_idx)) / video_fps)
                                 zone_completed_waits[i].append(wait)
                             zone_dwell[i].pop(cid, None)
                             zone_entry_frame[i].pop(cid, None)
                 for cid in list(zone_dwell[i]):
                     if cid not in visible_cids:
                         if zone_dwell[i][cid] >= min_frames:
-                            wait = (frame_idx - zone_entry_frame[i].get(cid, frame_idx)) / video_fps
+                            wait = max(0.0, (frame_idx - zone_entry_frame[i].get(cid, frame_idx)) / video_fps)
                             zone_completed_waits[i].append(wait)
                         zone_dwell[i].pop(cid, None)
                         zone_entry_frame[i].pop(cid, None)
@@ -399,7 +420,7 @@ def detector_worker(state: DetectorState):
             all_counts = {1: q1_count, 2: q2_count, 3: q3, 4: q4}
             total_q    = sum(all_counts[i] for i in range(1, checkouts_now + 1))
 
-            for lane in range(1, checkouts_now + 1):
+            for lane in range(3, checkouts_now + 1):
                 count = all_counts[lane]
                 cooldowns_ok = now_t - last_action_time >= POST_ACTION_COOLDOWN
                 if count <= CLOSE_LANE_MAX and total_q <= CLOSE_TOTAL_MAX and cooldowns_ok:
@@ -441,13 +462,13 @@ def detector_worker(state: DetectorState):
             q1_avg, q2_avg = None, None
             if state.zone1 is not None:
                 all_w = zone_completed_waits[0] + [
-                    (frame_idx - zone_entry_frame[0].get(cid, frame_idx)) / video_fps
+                    max(0.0, (frame_idx - zone_entry_frame[0].get(cid, frame_idx)) / video_fps)
                     for cid, f in zone_dwell[0].items() if f >= min_frames
                 ]
                 q1_avg = (sum(all_w) / len(all_w)) if all_w else None
             if state.zone2 is not None:
                 all_w = zone_completed_waits[1] + [
-                    (frame_idx - zone_entry_frame[1].get(cid, frame_idx)) / video_fps
+                    max(0.0, (frame_idx - zone_entry_frame[1].get(cid, frame_idx)) / video_fps)
                     for cid, f in zone_dwell[1].items() if f >= min_frames
                 ]
                 q2_avg = (sum(all_w) / len(all_w)) if all_w else None
@@ -470,11 +491,11 @@ def detector_worker(state: DetectorState):
             for (x1, y1, x2, y2), cid in visible:
                 if zone_dwell[0].get(cid, 0) >= min_frames:
                     color = ZONE_COLORS[0]
-                    wait_s = (frame_idx - zone_entry_frame[0].get(cid, frame_idx)) / video_fps
+                    wait_s = max(0.0, (frame_idx - zone_entry_frame[0].get(cid, frame_idx)) / video_fps)
                     label = f"Client {wait_s:.0f}s"
                 elif zone_dwell[1].get(cid, 0) >= min_frames:
                     color = ZONE_COLORS[1]
-                    wait_s = (frame_idx - zone_entry_frame[1].get(cid, frame_idx)) / video_fps
+                    wait_s = max(0.0, (frame_idx - zone_entry_frame[1].get(cid, frame_idx)) / video_fps)
                     label = f"Client {wait_s:.0f}s"
                 else:
                     color = BOX_COLOR
@@ -506,6 +527,7 @@ def detector_worker(state: DetectorState):
             now = time.time()
             processing_fps = frame_idx / max(1e-6, now - proc_t0)
             lines_hud = [f"avg: {avg_ms:.1f}ms", f"fps: {processing_fps:.1f}"]
+            lines_hud.append(f"clip: {clip_index + 1}/{len(state.video_paths)} {current_clip_name}")
             font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1
             pad, line_h = 20, 26
             sizes = [cv2.getTextSize(l, font, scale, thick)[0] for l in lines_hud]
@@ -529,8 +551,8 @@ def detector_worker(state: DetectorState):
                 latest_metrics.update({
                     "queue1": int(q1_count),
                     "queue2": int(q2_count),
-                    "queue1_avg_wait": round(q1_avg, 1) if q1_avg else None,
-                    "queue2_avg_wait": round(q2_avg, 1) if q2_avg else None,
+                    "queue1_avg_wait": round(q1_avg, 1) if q1_avg is not None else None,
+                    "queue2_avg_wait": round(q2_avg, 1) if q2_avg is not None else None,
                     "queue1_trend": q1_trend,
                     "queue2_trend": q2_trend,
                     "employees": int(employee_count),
@@ -538,8 +560,29 @@ def detector_worker(state: DetectorState):
                     "store_count": int(store_count),
                     "status": "ALERT" if is_alert else "MONITORING",
                     "fps": round(processing_fps, 1),
+                    "frame_processing_ms": round(avg_ms, 2),
                     "frame": int(frame_idx),
+                    "current_clip_index": clip_index + 1,
+                    "current_clip_total": len(state.video_paths),
+                    "current_clip_name": current_clip_name,
                 })
+
+            # Emit one telemetry line per second for Grafana Loki logs.
+            if now - last_telemetry_log_ts >= 1.0:
+                with metrics_lock:
+                    open_checkouts = int(latest_metrics.get("checkouts_open", 2))
+                    q3 = int(latest_metrics.get("queue3", 0))
+                    q4 = int(latest_metrics.get("queue4", 0))
+                print(
+                    "[TELEMETRY] "
+                    f"q1={q1_count} q2={q2_count} q3={q3} q4={q4} "
+                    f"wait1={q1_avg if q1_avg is not None else 0:.1f}s "
+                    f"wait2={q2_avg if q2_avg is not None else 0:.1f}s "
+                    f"store={store_count} open={open_checkouts} "
+                    f"fps={processing_fps:.1f} frame_ms={avg_ms:.1f}",
+                    flush=True,
+                )
+                last_telemetry_log_ts = now
 
             # Pace frame reads to match the source video's FPS.
             # If inference took longer than one frame period, skip the sleep
@@ -587,7 +630,7 @@ def agent_worker(stop_event: threading.Event):
 
         # Deterministic shortcut: lanes with 0-1 people are always closed —
         # no LLM reasoning needed, and minimum-1 guard is enforced inline.
-        if alert_type == "close" and alert_lane is not None and alert_count is not None and alert_count <= 1:
+        if alert_type == "close" and alert_lane in (3, 4) and alert_count is not None and alert_count <= 1:
             print(f"[AGENT] Deterministic close — lane {alert_lane} has {alert_count} people")
             with metrics_lock:
                 if latest_metrics["checkouts_open"] <= 1:
@@ -614,6 +657,16 @@ def agent_worker(stop_event: threading.Event):
                 "timestamp": time.strftime("%H:%M:%S"),
                 "raw":       "",
             }
+        elif alert_type == "close" and alert_lane in (1, 2):
+            result = {
+                "situation": f"Lane {alert_lane} is underutilised, but base checkout lanes cannot be closed.",
+                "reasoning": "Only checkout 3 and 4 may be closed by the agent.",
+                "action":    "none",
+                "urgency":   "low",
+                "tool_result": "Blocked: checkout 1 and 2 cannot be closed by the agent.",
+                "timestamp": time.strftime("%H:%M:%S"),
+                "raw":       "",
+            }
         else:
             # Pass alert context into snapshot so the LLM knows why it was triggered
             if alert_type == "close" and alert_lane is not None:
@@ -630,6 +683,18 @@ def agent_worker(stop_event: threading.Event):
                 print(f"[AGENT] Vetoed open_register — already at {checkouts_open_before} checkouts")
                 result["action"] = "none"
                 result["tool_result"] = "Vetoed: already at maximum 4 checkouts."
+
+        if "close_register" in result.get("action", "").lower():
+            action_value = result.get("action", "")
+            lane_value = None
+            if "(" in action_value and ")" in action_value:
+                lane_text = action_value.split("(", 1)[1].split(")", 1)[0].strip()
+                if lane_text.isdigit():
+                    lane_value = int(lane_text)
+            if lane_value not in (3, 4):
+                print(f"[AGENT] Vetoed close_register — lane {lane_value} is protected")
+                result["action"] = "none"
+                result["tool_result"] = "Vetoed: checkout 1 and 2 cannot be closed."
 
         print(f"[AGENT] {result.get('urgency','?').upper()} — {result.get('situation','')}")
 
@@ -702,7 +767,8 @@ def create_app(det_state: DetectorState):
 
     @app.route("/")
     def index():
-        return render_template("index.html")
+        grafana_url = os.environ.get("GRAFANA_URL", "http://localhost:3000/d/queue-monitor-ops")
+        return render_template("index.html", grafana_url=grafana_url)
 
     @app.route("/video")
     def video_stream():
@@ -771,6 +837,83 @@ def create_app(det_state: DetectorState):
         with metrics_lock:
             return jsonify(dict(latest_metrics))
 
+    @app.route("/statistics")
+    def statistics():
+        """Prometheus exposition endpoint for Grafana/Prometheus time-series."""
+        with metrics_lock:
+            m = dict(latest_metrics)
+
+        ts = int(time.time())
+        status = str(m.get("status", "unknown")).lower()
+        status_values = ["initializing", "running", "alert", "ended", "error", "resetting", "unknown"]
+
+        lines = [
+            "# HELP queue_monitor_queue_length Number of people currently waiting in each checkout lane.",
+            "# TYPE queue_monitor_queue_length gauge",
+            f'queue_monitor_queue_length{{lane="1"}} {int(m.get("queue1", 0))}',
+            f'queue_monitor_queue_length{{lane="2"}} {int(m.get("queue2", 0))}',
+            f'queue_monitor_queue_length{{lane="3"}} {int(m.get("queue3", 0))}',
+            f'queue_monitor_queue_length{{lane="4"}} {int(m.get("queue4", 0))}',
+            "",
+            "# HELP queue_monitor_avg_wait_seconds Average waiting time per lane in seconds.",
+            "# TYPE queue_monitor_avg_wait_seconds gauge",
+            f'queue_monitor_avg_wait_seconds{{lane="1"}} {float(m.get("queue1_avg_wait") or 0.0):.6f}',
+            f'queue_monitor_avg_wait_seconds{{lane="2"}} {float(m.get("queue2_avg_wait") or 0.0):.6f}',
+            "",
+            "# HELP queue_monitor_checkouts_open Number of open checkouts.",
+            "# TYPE queue_monitor_checkouts_open gauge",
+            f"queue_monitor_checkouts_open {int(m.get('checkouts_open', 2))}",
+            "",
+            "# HELP queue_monitor_store_count Total number of customers in store.",
+            "# TYPE queue_monitor_store_count gauge",
+            f"queue_monitor_store_count {int(m.get('store_count', 0))}",
+            "",
+            "# HELP queue_monitor_clients_visible Number of clients visible in camera view.",
+            "# TYPE queue_monitor_clients_visible gauge",
+            f"queue_monitor_clients_visible {int(m.get('clients_visible', 0))}",
+            "",
+            "# HELP queue_monitor_employees_visible Number of employees visible in camera view.",
+            "# TYPE queue_monitor_employees_visible gauge",
+            f"queue_monitor_employees_visible {int(m.get('employees', 0))}",
+            "",
+            "# HELP queue_monitor_fps Detection/render loop FPS.",
+            "# TYPE queue_monitor_fps gauge",
+            f"queue_monitor_fps {float(m.get('fps', 0.0)):.6f}",
+            "",
+            "# HELP queue_monitor_frame_processing_seconds Average frame processing time in seconds.",
+            "# TYPE queue_monitor_frame_processing_seconds gauge",
+            f"queue_monitor_frame_processing_seconds {float(m.get('frame_processing_ms', 0.0)) / 1000.0:.6f}",
+            "",
+            "# HELP queue_monitor_frames_total Total processed frames.",
+            "# TYPE queue_monitor_frames_total counter",
+            f"queue_monitor_frames_total {int(m.get('frame', 0))}",
+            "",
+            "# HELP queue_monitor_video_total_frames Total frames in the loaded source video.",
+            "# TYPE queue_monitor_video_total_frames gauge",
+            f"queue_monitor_video_total_frames {int(m.get('total_frames', 0))}",
+            "",
+            "# HELP queue_monitor_status Status one-hot metric by state label.",
+            "# TYPE queue_monitor_status gauge",
+        ]
+
+        for s in status_values:
+            lines.append(f'queue_monitor_status{{state="{s}"}} {1 if s == status else 0}')
+
+        lines.extend([
+            "",
+            "# HELP queue_monitor_last_action_timestamp_unix Unix timestamp of latest tool action.",
+            "# TYPE queue_monitor_last_action_timestamp_unix gauge",
+            f"queue_monitor_last_action_timestamp_unix {float(m.get('last_action_time', 0.0)):.3f}",
+            "",
+            "# HELP queue_monitor_exporter_timestamp_unix Export timestamp for diagnostics.",
+            "# TYPE queue_monitor_exporter_timestamp_unix gauge",
+            f"queue_monitor_exporter_timestamp_unix {ts}",
+            "",
+        ])
+
+        payload = "\n".join(lines)
+        return Response(payload, mimetype="text/plain; version=0.0.4; charset=utf-8")
+
     @app.route("/reset", methods=["POST"])
     def reset():
         """Debug reset: seek video to frame 0 and reinitialise all state."""
@@ -784,7 +927,8 @@ def create_app(det_state: DetectorState):
                 "employees": 0, "clients_visible": 0, "store_count": 0,
                 "checkouts_open": 2,
                 "last_action": None, "last_action_time": 0.0,
-                "status": "resetting",
+                "status": "resetting", "fps": 0.0,
+                "frame_processing_ms": 0.0, "frame": 0,
             })
         for num in (3, 4):
             extra_checkout_state[num].update({"count": 0, "trend": 1, "next_update": 0.0})

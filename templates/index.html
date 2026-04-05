@@ -11,26 +11,25 @@
 </head>
 <body>
 
-  <!-- ── Header ──────────────────────────────────────────── -->
+  <!-- ── Header + Tabs ───────────────────────────────────── -->
   <header class="header">
     <div class="header-left">
       <span class="pulse-dot"></span>
       <span class="header-title">QUEUE MONITOR</span>
+      <nav class="tab-nav">
+        <button class="tab-button tab-button-active" data-tab="monitor">
+          📊 Monitor
+        </button>
+        <button class="tab-button" data-tab="dashboard" id="dashboard-tab-btn">
+          📈 Dashboard
+        </button>
+      </nav>
+      <span id="grafana-url" hidden>{{ grafana_url }}</span>
     </div>
     <div class="header-right">
       <span class="header-clock" id="clock">00:00:00</span>
     </div>
   </header>
-
-  <!-- ── Tab Navigation ───────────────────────────────────── -->
-  <nav class="tab-nav">
-    <button class="tab-button tab-button-active" data-tab="monitor">
-      📊 Monitor
-    </button>
-    <button class="tab-button" data-tab="dashboard">
-      📈 Dashboard
-    </button>
-  </nav>
 
   <!-- ── Main layout ─────────────────────────────────────── -->
   <main class="main">
@@ -138,8 +137,8 @@
             </button>
           </div>
           <div class="dashboard-info">
-            <p>Grafana URL: <code id="grafana-url">Not configured</code></p>
-            <p>Stats endpoint: <code>/statistics</code> (coming soon)</p>
+            <p>Grafana URL: <code>{{ grafana_url }}</code></p>
+            <p>Stats endpoint: <code>/statistics</code></p>
           </div>
         </div>
       </div>

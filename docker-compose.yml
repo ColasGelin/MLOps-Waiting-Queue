@@ -4,7 +4,7 @@
 #   docker compose up --build
 #
 # Configure via a .env file or shell environment:
-#   VIDEO_FILE=/data/testclip.mp4
+#   VIDEO_FILE=/data/testclip.mp4,/data/testclip2.mp4
 #   ZONE1=100,50,500,50,500,400,100,400
 #   ZONE2=520,50,920,50,920,400,520,400
 #   YOLO_DEVICE=cpu          (use "0" for GPU, see docker-compose.gpu.yml)
@@ -44,7 +44,10 @@ services:
     environment:
       OLLAMA_HOST:  http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
-      VIDEO_FILE:   ${VIDEO_FILE:-/data/testclip2.mp4}
+      OLLAMA_PULL_ON_START: ${OLLAMA_PULL_ON_START:-true}
+      OLLAMA_REQUIRE_MODEL: ${OLLAMA_REQUIRE_MODEL:-true}
+      GRAFANA_URL:  ${GRAFANA_URL:-http://localhost:3000/d/queue-monitor-ops}
+      VIDEO_FILE:   ${VIDEO_FILE:-/data/testclip.mp4,/data/testclip2.mp4}
       YOLO_MODEL:   ${YOLO_MODEL:-/data/runs/detect/runs/supermarket_finetune/weights/best.pt}
       CONF_THRESH:  ${CONF_THRESH:-0.35}
       YOLO_DEVICE:  ${YOLO_DEVICE:-cpu}
@@ -55,7 +58,78 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/metrics >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── Grafana for metrics visualization ──────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: qm-grafana
+    profiles: ["observability"]
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_SERVER_SERVE_FROM_SUB_PATH=false
+      - GF_DASHBOARDS_MIN_REFRESH_INTERVAL=1s
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - app
+      - loki
+    restart: unless-stopped
+
+  # ── Prometheus metrics collector ───────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: qm-prometheus
+    profiles: ["observability"]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  # ── Loki log store (Grafana logs) ───────────────────────────────────────
+  loki:
+    image: grafana/loki:2.9.8
+    container_name: qm-loki
+    profiles: ["observability"]
+    ports:
+      - "3100:3100"
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    restart: unless-stopped
+
+  # ── Promtail log shipper (Docker logs -> Loki) ─────────────────────────
+  promtail:
+    image: grafana/promtail:2.9.8
+    container_name: qm-promtail
+    profiles: ["observability"]
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - ./promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      - loki
     restart: unless-stopped
 
 volumes:
   ollama_data:
+  grafana_data:
+  prometheus_data:
