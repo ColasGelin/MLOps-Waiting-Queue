@@ -267,6 +267,8 @@ function decisionClass(action) {
   const a = (action || "none").toLowerCase();
   if (a.includes("open_register"))  return "card-decision-open";
   if (a.includes("close_register")) return "card-decision-close";
+  if (a.includes("redirect_customers")) return "card-decision-redirect";
+  if (a.includes("alert_supervisor")) return "card-decision-supervisor";
   return "card-decision-none";
 }
 
@@ -321,6 +323,7 @@ function actionLabel(action, data = {}) {
   const a = (action || "none").toLowerCase();
   if (a.includes("open_register"))  return { text: "Opening Checkout", cls: "decision-label-open" };
   if (a.includes("close_register")) return { text: "Closing Checkout", cls: "decision-label-close" };
+  if (a.includes("alert_supervisor")) return { text: "Calling Supervisor", cls: "decision-label-supervisor" };
 
   // redirect_customers(from_lane, to_lane) — show "Redirect Lane X → Lane Y"
   const redirectMatch = a.match(/redirect_customers\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/);
@@ -331,10 +334,14 @@ function actionLabel(action, data = {}) {
   // Fallback: match redirection language in reasoning/situation/tool_result
   const hint = `${data.reasoning || ""} ${data.situation || ""} ${data.tool_result || ""}`.toLowerCase();
   const redirectPattern = /(redirect|redistribut|move\s+to\s+checkout|move\s+customers?|switch\s+lanes?)/;
+  const supervisorPattern = /(supervisor|manager|floor\s+staff|staff\s+support)/;
   const noActionPattern = /^(none|no\s*action|no_action|no-action)$/;
 
   if (redirectPattern.test(a) || redirectPattern.test(hint)) {
     return { text: "Suggest Redirection", cls: "decision-label-redirect" };
+  }
+  if (supervisorPattern.test(a) || supervisorPattern.test(hint)) {
+    return { text: "Calling Supervisor", cls: "decision-label-supervisor" };
   }
   if (noActionPattern.test(a)) {
     return { text: "No Action Taken", cls: "decision-label-none" };

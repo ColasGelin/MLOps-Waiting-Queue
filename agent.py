@@ -3,6 +3,7 @@ LangGraph Agent — Queue Management Decision Maker
 Uses Ollama (llama3.1) to analyze queue metrics and decide actions.
 """
 
+import logging
 import os
 import re
 import time
@@ -13,6 +14,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("agent")
 
 # Get the Flask server base URL from env, default to localhost
 FLASK_BASE_URL = os.environ.get("FLASK_BASE_URL", "http://localhost:8000")
@@ -93,41 +101,27 @@ TOOL_MAP = {t.name: t for t in TOOLS}
 # ── System prompt ────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an AI queue management agent monitoring a supermarket checkout area in real-time.
+You are a supermarket queue management agent.
 
-STORE LAYOUT:
-- Lane 1 & 2: Always open (real CV counts)
-- Lane 3 & 4: You open/close these dynamically
-- checkouts_open: Total active checkouts (min 2, max 4)
+STORE:
+- Lanes 1 & 2: always open
+- Lanes 3 & 4: you open or close dynamically
+- Min 2 checkouts open, max 4
 
-TOOLS:
-  open_register(lane_id)
-  close_register(lane_id)
-  redirect_customers(from_lane, to_lane)
-  alert_supervisor(message, urgency)
-  flag_anomaly(description)
-  generate_shift_report()
+TOOLS: open_register(lane_id), close_register(lane_id), redirect_customers(from_lane, to_lane), alert_supervisor(message, urgency), none
 
-DECISION RULES — check in order:
+RULES (in order of priority):
+1. If a lane has 5+ people AND a free lane exists → open_register
+2. If a lane has 5+ people AND no free lane AND another lane has 0-2 people → redirect_customers
+3. If a dynamic lane (3 or 4) has 0-1 people AND no lane is overloaded → close_register
+4. If a lane has 6+ people and no safe open/redirect move exists → alert_supervisor("Queue overload needs staff support", "high")
+5. Otherwise → none
 
-1. OVERLOADED LANE (any lane has 5+ people)?
-   - Is there another OPEN lane with 2 or fewer people? → redirect_customers(from_lane=overloaded, to_lane=quiet). Use exact lane numbers.
-   - No open lane has 2 or fewer people? → open_register (3 first, then 4). Only if can_open_more is true.
+Don't talk about the rules in the reasoning sentence. Use the rules to make a decision, but the reasoning should be based on the current situation and not explicitly reference the rules.
 
-2. IDLE DYNAMIC LANE (lane 3 or 4 has 0-1 people, no other lane above 4)?
-   → close_register (4 first, then 3). Only if checkouts_open > 2.
-
-3. NOTHING TRIGGERED? → none.
-
-HARD LIMITS:
-  • Never open if can_open_more is false
-  • Never close if checkouts_open == 2
-  • Never redirect if all open lanes are similarly busy
-  • One action per cycle only
-
-Respond in EXACTLY this format:
+Respond ONLY in this format:
 SITUATION: <one sentence>
-REASONING: <one sentence>
+REASONING: <one sentence, include the actual numbers>
 ACTION: <tool_name(params)> or none
 URGENCY: <low | medium | high>
 """
@@ -181,17 +175,27 @@ def analyze_node(state: AgentState) -> dict:
     close_hint = m.get("_close_hint")
     if close_hint:
         human_msg += f"\n\nTRIGGER: {close_hint} Do NOT open a register. Decide whether to close one."
+    log.debug("=== analyze_node called ===")
+    log.debug("Human message sent to LLM:\n%s", human_msg)
     try:
         import os
         ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        log.debug("Using Ollama at %s", ollama_host)
         llm = ChatOllama(model="llama3.1", temperature=0.3, base_url=ollama_host)
+        t0 = time.time()
         response = llm.invoke([
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=human_msg),
         ])
+        elapsed = time.time() - t0
+        log.debug("LLM responded in %.2fs", elapsed)
+        log.debug("Raw LLM output:\n%s", response.content)
         parsed = parse_agent_response(response.content)
+        log.debug("Parsed result: situation=%r action=%r urgency=%r",
+                  parsed.get("situation"), parsed.get("action"), parsed.get("urgency"))
         return parsed
     except Exception as e:
+        log.error("LLM call failed: %s", e, exc_info=True)
         return {
             "situation": "Agent connection unavailable",
             "reasoning": f"Could not reach Ollama: {str(e)[:120]}",
@@ -246,29 +250,54 @@ def parse_agent_response(text: str) -> dict:
         "urgency": "low",
         "raw": text,
     }
+    found_keys = set()
     for line in text.strip().split("\n"):
         line = line.strip()
         upper = line.upper()
         if upper.startswith("SITUATION:"):
             result["situation"] = line.split(":", 1)[1].strip()
+            found_keys.add("SITUATION")
         elif upper.startswith("REASONING:"):
             result["reasoning"] = line.split(":", 1)[1].strip()
+            found_keys.add("REASONING")
         elif upper.startswith("ACTION:"):
             result["action"] = line.split(":", 1)[1].strip()
+            found_keys.add("ACTION")
         elif upper.startswith("URGENCY:"):
             result["urgency"] = line.split(":", 1)[1].strip().lower()
+            found_keys.add("URGENCY")
+
+    missing = {"SITUATION", "REASONING", "ACTION", "URGENCY"} - found_keys
+    if missing:
+        log.warning("LLM response missing fields %s — raw output was:\n%s", missing, text)
+
     return result
 
 
 def _execute_tool(action_str: str) -> Optional[str]:
     """Parse 'tool_name(args)' and invoke the matching tool."""
-    if action_str.strip().lower() in ("none", "no action", ""):
+    log.debug("_execute_tool called with: %r", action_str)
+    action_candidate = action_str.strip()
+    action_lower = action_candidate.lower()
+
+    if action_lower in ("none", "no action", ""):
         return None
-    match = re.match(r"(\w+)\((.*)\)", action_str.strip())
+
+    # Be tolerant if the model uses natural language like "calling supervisor".
+    if re.search(r"\b(call|alert)(ing)?\s+(the\s+)?supervisor\b", action_lower):
+        action_candidate = 'alert_supervisor("Queue needs supervisor support", "high")'
+    elif action_lower in ("alert_supervisor", "call_supervisor", "supervisor"):
+        action_candidate = 'alert_supervisor("Queue needs supervisor support", "high")'
+
+    match = re.match(r"(\w+)\((.*)\)", action_candidate)
     if not match:
+        log.warning("Could not parse action string: %r", action_str)
         return f"Could not parse action: {action_str}"
     name = match.group(1)
+    if name in ("call_supervisor", "notify_supervisor"):
+        name = "alert_supervisor"
     if name not in TOOL_MAP:
+        log.warning("Unknown tool name %r in action: %r", name, action_str)
         return f"Unknown tool: {name}"
     args_raw = match.group(2).strip()
 
@@ -284,9 +313,12 @@ def _execute_tool(action_str: str) -> Optional[str]:
             to_lane = int(nums[1]) if len(nums) >= 2 else 2
             return tool_fn.invoke({"from_lane": from_lane, "to_lane": to_lane})
         elif name == "alert_supervisor":
-            parts = args_raw.split(",", 1)
-            msg = parts[0].strip().strip("\"'")
-            urg = parts[1].strip().strip("\"'") if len(parts) > 1 else "medium"
+            if not args_raw:
+                msg, urg = "Queue needs supervisor support", "medium"
+            else:
+                parts = args_raw.split(",", 1)
+                msg = parts[0].strip().strip("\"'") or "Queue needs supervisor support"
+                urg = parts[1].strip().strip("\"'") if len(parts) > 1 else "medium"
             return tool_fn.invoke({"message": msg, "urgency": urg})
         elif name == "flag_anomaly":
             desc = args_raw.strip().strip("\"'")
@@ -296,6 +328,7 @@ def _execute_tool(action_str: str) -> Optional[str]:
         else:
             return f"Tool {name} executed."
     except Exception as e:
+        log.error("Tool %r raised an exception: %s", name, e, exc_info=True)
         return f"Tool error: {e}"
 
 

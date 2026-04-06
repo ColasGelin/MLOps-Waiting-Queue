@@ -99,6 +99,20 @@ latest_metrics = {
     "checkouts_open": 2,
     "last_action": None,       # e.g. "open_register(1)"
     "last_action_time": 0.0,   # unix timestamp of last tool action
+    "llm_processing_seconds": 0.0,  # duration of last actual LLM call
+    "llm_urgency": 0,               # 0=idle, 1=low, 2=medium, 3=high
+    "llm_last_action": 0,           # 0=none, 1=open_register, 2=close_register, 3=redirect_customers, 4=alert_supervisor
+    "llm_decisions_open": 0,
+    "llm_decisions_close": 0,
+    "llm_decisions_redirect": 0,
+    "llm_decisions_supervisor": 0,
+    "llm_decisions_none": 0,
+    "llm_open_trigger_queue": 0,    # queue count of triggering lane when open was decided
+    "llm_close_trigger_queue": 0,   # queue count of triggering lane when close was decided
+    "llm_none_trigger_queue": 0,    # queue count of triggering lane when no action was decided
+    "llm_open_trigger_store": 0,    # store_count at last open-register decision
+    "llm_close_trigger_store": 0,   # store_count at last close-register decision
+    "llm_none_trigger_store": 0,    # store_count at last no-action decision
     "status": "initializing",
     "fps": 0.0,
     "frame_processing_ms": 0.0,
@@ -106,6 +120,12 @@ latest_metrics = {
     "total_frames": 0,
 }
 metrics_lock = threading.Lock()
+
+# Cached Prometheus payload — rebuilt at most every 3s so scrapes never
+# block the YOLO/MJPEG threads during heavy inference cycles.
+_stats_cache: dict = {"payload": None, "ts": 0.0}
+_stats_cache_lock = threading.Lock()
+_STATS_CACHE_TTL = 3.0  # seconds
 
 # Simulated activity state for dynamic checkouts (3 and 4), backend-owned.
 # Each checkout has its own next_update timestamp for irregular timing.
@@ -630,6 +650,9 @@ def agent_worker(stop_event: threading.Event):
 
         # Deterministic shortcut: lanes with 0-1 people are always closed —
         # no LLM reasoning needed, and minimum-1 guard is enforced inline.
+        _trigger_queue = int(snapshot.get(f"queue{alert_lane}", 0)) if alert_lane is not None else 0
+        _trigger_store = int(snapshot.get("store_count", 0))
+        _llm_elapsed = 0.0
         if alert_type == "close" and alert_lane in (3, 4) and alert_count is not None and alert_count <= 1:
             print(f"[AGENT] Deterministic close — lane {alert_lane} has {alert_count} people")
             with metrics_lock:
@@ -674,7 +697,9 @@ def agent_worker(stop_event: threading.Event):
                                            f"{alert_count} people. Consider closing it.")
             print(f"[AGENT] Calling agent — Q1:{snapshot.get('queue1',0)} "
                   f"Q2:{snapshot.get('queue2',0)} Store:{snapshot.get('store_count',0)}")
+            _llm_t0 = time.time()
             result = run_agent(snapshot)
+            _llm_elapsed = time.time() - _llm_t0
 
         # Hard guard: veto open_register only if we were already at max
         # before the agent decision executed any tool side effects.
@@ -700,11 +725,39 @@ def agent_worker(stop_event: threading.Event):
 
         # Log the action taken (tool calls update metrics via /add_checkout or /remove_checkout)
         action = result.get("action", "none").lower()
-        if "open_register" in action or "close_register" in action:
+        if ("open_register" in action or "close_register" in action
+            or "redirect_customers" in action or "alert_supervisor" in action):
             log_event(f"Action taken: {result.get('action', 'none')}")
 
         with agent_busy_lock:
             agent_busy = False
+
+        _urgency_map = {"low": 1, "medium": 2, "high": 3}
+        _action_str = result.get("action", "none").lower()
+        _action_code = (1 if "open_register" in _action_str else
+                        2 if "close_register" in _action_str else
+                        3 if "redirect_customers" in _action_str else
+                        4 if "alert_supervisor" in _action_str else 0)
+        with metrics_lock:
+            latest_metrics["llm_processing_seconds"] = round(_llm_elapsed, 3)
+            latest_metrics["llm_urgency"] = _urgency_map.get(result.get("urgency", "").lower(), 0)
+            latest_metrics["llm_last_action"] = _action_code
+            if _action_code == 1:
+                latest_metrics["llm_decisions_open"] += 1
+                latest_metrics["llm_open_trigger_queue"] = _trigger_queue
+                latest_metrics["llm_open_trigger_store"] = _trigger_store
+            elif _action_code == 2:
+                latest_metrics["llm_decisions_close"] += 1
+                latest_metrics["llm_close_trigger_queue"] = _trigger_queue
+                latest_metrics["llm_close_trigger_store"] = _trigger_store
+            elif _action_code == 3:
+                latest_metrics["llm_decisions_redirect"] += 1
+            elif _action_code == 4:
+                latest_metrics["llm_decisions_supervisor"] += 1
+            else:
+                latest_metrics["llm_decisions_none"] += 1
+                latest_metrics["llm_none_trigger_queue"] = _trigger_queue
+                latest_metrics["llm_none_trigger_store"] = _trigger_store
 
         broadcast_event({
             "type": "agent_decision",
@@ -840,10 +893,15 @@ def create_app(det_state: DetectorState):
     @app.route("/statistics")
     def statistics():
         """Prometheus exposition endpoint for Grafana/Prometheus time-series."""
+        now = time.time()
+        with _stats_cache_lock:
+            if _stats_cache["payload"] is not None and now - _stats_cache["ts"] < _STATS_CACHE_TTL:
+                return Response(_stats_cache["payload"], mimetype="text/plain; version=0.0.4; charset=utf-8")
+
         with metrics_lock:
             m = dict(latest_metrics)
 
-        ts = int(time.time())
+        ts = int(now)
         status = str(m.get("status", "unknown")).lower()
         status_values = ["initializing", "running", "alert", "ended", "error", "resetting", "unknown"]
 
@@ -905,6 +963,50 @@ def create_app(det_state: DetectorState):
             "# TYPE queue_monitor_last_action_timestamp_unix gauge",
             f"queue_monitor_last_action_timestamp_unix {float(m.get('last_action_time', 0.0)):.3f}",
             "",
+            "# HELP queue_monitor_llm_processing_seconds Duration of the last LLM agent call in seconds.",
+            "# TYPE queue_monitor_llm_processing_seconds gauge",
+            f"queue_monitor_llm_processing_seconds {float(m.get('llm_processing_seconds', 0.0)):.3f}",
+            "",
+            "# HELP queue_monitor_llm_urgency Urgency of last LLM decision (0=idle,1=low,2=medium,3=high).",
+            "# TYPE queue_monitor_llm_urgency gauge",
+            f"queue_monitor_llm_urgency {int(m.get('llm_urgency', 0))}",
+            "",
+            "# HELP queue_monitor_llm_last_action Last LLM action type (0=none,1=open_register,2=close_register,3=redirect_customers,4=alert_supervisor).",
+            "# TYPE queue_monitor_llm_last_action gauge",
+            f"queue_monitor_llm_last_action {int(m.get('llm_last_action', 0))}",
+            "",
+            "# HELP queue_monitor_llm_decisions_total Cumulative LLM decisions by action type.",
+            "# TYPE queue_monitor_llm_decisions_total counter",
+            f'queue_monitor_llm_decisions_total{{action="open_register"}} {int(m.get("llm_decisions_open", 0))}',
+            f'queue_monitor_llm_decisions_total{{action="close_register"}} {int(m.get("llm_decisions_close", 0))}',
+            f'queue_monitor_llm_decisions_total{{action="redirect_customers"}} {int(m.get("llm_decisions_redirect", 0))}',
+            f'queue_monitor_llm_decisions_total{{action="alert_supervisor"}} {int(m.get("llm_decisions_supervisor", 0))}',
+            f'queue_monitor_llm_decisions_total{{action="none"}} {int(m.get("llm_decisions_none", 0))}',
+            "",
+            "# HELP queue_monitor_llm_open_trigger_queue Queue count of triggering lane at last open-register decision.",
+            "# TYPE queue_monitor_llm_open_trigger_queue gauge",
+            f"queue_monitor_llm_open_trigger_queue {int(m.get('llm_open_trigger_queue', 0))}",
+            "",
+            "# HELP queue_monitor_llm_close_trigger_queue Queue count of triggering lane at last close-register decision.",
+            "# TYPE queue_monitor_llm_close_trigger_queue gauge",
+            f"queue_monitor_llm_close_trigger_queue {int(m.get('llm_close_trigger_queue', 0))}",
+            "",
+            "# HELP queue_monitor_llm_none_trigger_queue Queue count of triggering lane at last no-action decision.",
+            "# TYPE queue_monitor_llm_none_trigger_queue gauge",
+            f"queue_monitor_llm_none_trigger_queue {int(m.get('llm_none_trigger_queue', 0))}",
+            "",
+            "# HELP queue_monitor_llm_open_trigger_store Store count at last open-register decision.",
+            "# TYPE queue_monitor_llm_open_trigger_store gauge",
+            f"queue_monitor_llm_open_trigger_store {int(m.get('llm_open_trigger_store', 0))}",
+            "",
+            "# HELP queue_monitor_llm_close_trigger_store Store count at last close-register decision.",
+            "# TYPE queue_monitor_llm_close_trigger_store gauge",
+            f"queue_monitor_llm_close_trigger_store {int(m.get('llm_close_trigger_store', 0))}",
+            "",
+            "# HELP queue_monitor_llm_none_trigger_store Store count at last no-action decision.",
+            "# TYPE queue_monitor_llm_none_trigger_store gauge",
+            f"queue_monitor_llm_none_trigger_store {int(m.get('llm_none_trigger_store', 0))}",
+            "",
             "# HELP queue_monitor_exporter_timestamp_unix Export timestamp for diagnostics.",
             "# TYPE queue_monitor_exporter_timestamp_unix gauge",
             f"queue_monitor_exporter_timestamp_unix {ts}",
@@ -912,6 +1014,9 @@ def create_app(det_state: DetectorState):
         ])
 
         payload = "\n".join(lines)
+        with _stats_cache_lock:
+            _stats_cache["payload"] = payload
+            _stats_cache["ts"] = now
         return Response(payload, mimetype="text/plain; version=0.0.4; charset=utf-8")
 
     @app.route("/reset", methods=["POST"])
@@ -927,6 +1032,14 @@ def create_app(det_state: DetectorState):
                 "employees": 0, "clients_visible": 0, "store_count": 0,
                 "checkouts_open": 2,
                 "last_action": None, "last_action_time": 0.0,
+                "llm_processing_seconds": 0.0, "llm_urgency": 0,
+                "llm_last_action": 0, "llm_decisions_open": 0,
+                "llm_decisions_close": 0, "llm_decisions_redirect": 0,
+                "llm_decisions_supervisor": 0, "llm_decisions_none": 0,
+                "llm_open_trigger_queue": 0, "llm_close_trigger_queue": 0,
+                "llm_none_trigger_queue": 0,
+                "llm_open_trigger_store": 0, "llm_close_trigger_store": 0,
+                "llm_none_trigger_store": 0,
                 "status": "resetting", "fps": 0.0,
                 "frame_processing_ms": 0.0, "frame": 0,
             })
